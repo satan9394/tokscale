@@ -1,6 +1,7 @@
+mod amp;
 mod antigravity;
 mod auth;
-mod claude_diagnostics;
+mod client_diagnostics;
 mod commands;
 mod cursor;
 mod device;
@@ -9,9 +10,11 @@ mod paths;
 mod process_liveness;
 mod trae;
 mod tui;
+mod ui_glyphs;
 mod warp;
 
 use crate::tui::client_ui;
+use crate::ui_glyphs::Glyphs;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::io::{self, IsTerminal, Write};
@@ -31,6 +34,13 @@ struct Cli {
 
     #[arg(short, long)]
     theme: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Use local data and cached pricing without network requests"
+    )]
+    offline: bool,
 
     #[arg(short, long, default_value = "0")]
     refresh: u64,
@@ -90,7 +100,7 @@ struct Cli {
         long,
         value_name = "STRATEGY",
         default_value = "client,model",
-        help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model"
+        help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model, machine,model"
     )]
     group_by: String,
 
@@ -122,7 +132,7 @@ enum Commands {
             long,
             value_name = "STRATEGY",
             default_value = "client,model",
-            help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model"
+            help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model, machine,model"
         )]
         group_by: String,
         #[arg(
@@ -194,7 +204,9 @@ enum Commands {
     },
     #[command(about = "Show pricing for a model")]
     Pricing {
-        #[arg(help = "Model ID to look up, or `list-overrides`")]
+        #[arg(
+            help = "Model ID, `refresh` (download catalogs), `list-overrides`, `validate-overrides`, or `explain` (local per-message pricing report)"
+        )]
         model_id: String,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -203,6 +215,22 @@ enum Commands {
             help = "Force specific pricing source (custom, litellm, openrouter, or models.dev)"
         )]
         provider: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "provider",
+            help = "Pricing source (custom, litellm, openrouter, models.dev)"
+        )]
+        source: Option<String>,
+        #[arg(
+            long,
+            help = "Exact log-declared billing channel; trim and ASCII case-insensitive"
+        )]
+        billing_provider: Option<String>,
+        #[arg(
+            long,
+            help = "Fail validate-overrides on configuration errors (validation is always offline)"
+        )]
+        strict: bool,
         #[arg(long, help = "Disable spinner")]
         no_spinner: bool,
     },
@@ -260,6 +288,17 @@ enum Commands {
         output: Option<String>,
         #[arg(long, help = "Parse and summarize only; do not emit normalized JSON")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Upload the imported history to the leaderboard, labelled as backfill (requires login)"
+        )]
+        submit: bool,
+        #[arg(
+            long,
+            requires = "submit",
+            help = "Label naming where the imported data came from (default: the --format value)"
+        )]
+        importer: Option<String>,
     },
     #[command(about = "Launch interactive TUI with optional filters")]
     Tui {
@@ -279,6 +318,14 @@ enum Commands {
             help = "Show what would be submitted without actually submitting"
         )]
         dry_run: bool,
+        #[arg(
+            long,
+            alias = "cursor-timeout",
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(1..=cursor::CURSOR_MAX_SYNC_TIMEOUT_SECS),
+            help = "Cursor sync timeout in seconds, 1-86400 (overrides cursor.syncTimeoutSeconds in settings.json)"
+        )]
+        timeout: Option<u64>,
     },
     #[command(about = "Manage periodic usage submission")]
     Autosubmit {
@@ -318,8 +365,6 @@ enum Commands {
             help = "Show Top Clients instead of Top OpenCode Agents"
         )]
         show_clients: bool,
-        #[arg(long, help = "Disable pinning of Sisyphus agents in rankings")]
-        disable_pinned: bool,
         #[arg(long, help = "Disable loading spinner (for scripting)")]
         no_spinner: bool,
     },
@@ -334,6 +379,11 @@ enum Commands {
     Codex {
         #[command(subcommand)]
         subcommand: CodexSubcommand,
+    },
+    #[command(about = "Amp thread sync commands (exports threads via the amp CLI)")]
+    Amp {
+        #[command(subcommand)]
+        subcommand: AmpSubcommand,
     },
     #[command(about = "Cursor API cache integration commands")]
     Cursor {
@@ -442,6 +492,17 @@ enum ConfigSubcommand {
 }
 
 #[derive(Subcommand)]
+enum AmpSubcommand {
+    #[command(about = "Export Amp threads into the local cache via the amp CLI")]
+    Sync {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(long, help = "Total sync timeout in seconds (default: 60)")]
+        timeout: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
 enum CursorSubcommand {
     #[command(about = "Login to Cursor (auto-detect desktop session, or paste browser token)")]
     Login {
@@ -467,10 +528,17 @@ enum CursorSubcommand {
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
-    #[command(about = "Sync Cursor API usage into cursor-cache/usage*.csv")]
+    #[command(about = "Sync Cursor API usage into cursor-cache/usage*.json")]
     Sync {
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(1..=cursor::CURSOR_MAX_SYNC_TIMEOUT_SECS),
+            help = "Overall sync timeout in seconds, 1-86400 (overrides cursor.syncTimeoutSeconds in settings.json and the default dynamic budget)"
+        )]
+        timeout: Option<u64>,
     },
     #[command(about = "Switch active Cursor account")]
     Switch {
@@ -607,10 +675,30 @@ enum HindsightSubcommand {
     },
 }
 
+// A deny-by-default command boundary prevents auth, submission and helper
+// processes from becoming accidental network side effects of --offline.
+fn validate_offline_command(command: Option<&Commands>) -> Result<()> {
+    match command {
+        None | Some(Commands::Models { .. } | Commands::Monthly { .. }
+            | Commands::Hourly { .. } | Commands::Clients { .. } | Commands::Graph { .. }
+            | Commands::Tui { .. } | Commands::TimeMetrics { .. } | Commands::WarmTuiCache
+            | Commands::Wrapped { .. } | Commands::Config { .. }) => Ok(()),
+        Some(Commands::Pricing { model_id, .. }) if !model_id.eq_ignore_ascii_case("refresh") => Ok(()),
+        Some(Commands::Import { submit: false, .. }) => Ok(()),
+        Some(Commands::Report { no_summarize: true, .. }) => Ok(()),
+        Some(Commands::Report { .. }) => anyhow::bail!("--offline report requires --no-summarize; summarizers may launch network-capable helpers"),
+        _ => anyhow::bail!("This command requires online mode; omit --offline. Offline mode supports local reports, TUI, cached pricing and local imports"),
+    }
+}
+
 fn main() -> Result<()> {
     use std::io::IsTerminal;
 
     let cli = Cli::parse();
+    if cli.offline {
+        validate_offline_command(cli.command.as_ref())?;
+        tokscale_core::network::go_offline();
+    }
     // Install user-configured model aliases once, before any report/graph/TUI
     // path runs, so model-name variants fold consistently across every command.
     // Honors the global `--home` override exactly like scanner settings; an
@@ -780,10 +868,20 @@ fn main() -> Result<()> {
             model_id,
             json,
             provider,
+            source,
+            billing_provider,
+            strict,
             no_spinner,
         }) => {
             reject_unsupported_home_override(&cli.home, "pricing")?;
-            run_pricing_lookup(&model_id, json, provider.as_deref(), no_spinner)
+            run_pricing_lookup(
+                &model_id,
+                json,
+                source.as_deref().or(provider.as_deref()),
+                billing_provider.as_deref(),
+                strict,
+                no_spinner,
+            )
         }
         Some(Commands::Clients { json }) => run_clients_command(json, cli.home.clone()),
         Some(Commands::Login { token }) => {
@@ -824,9 +922,11 @@ fn main() -> Result<()> {
             format,
             output,
             dry_run,
+            submit,
+            importer,
         }) => {
             reject_unsupported_home_override(&cli.home, "import")?;
-            run_import_command(file, format, output, dry_run)
+            run_import_command(file, format, output, dry_run, submit, importer)
         }
         Some(Commands::Tui { clients, date }) => {
             ensure_home_supported_for_tui(&cli.home)?;
@@ -850,6 +950,7 @@ fn main() -> Result<()> {
             clients,
             date,
             dry_run,
+            timeout,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
             let (since, until) = build_date_filter(&date, &cli.home);
@@ -860,6 +961,7 @@ fn main() -> Result<()> {
             // defaultClients view filter (which may exclude clients they still want
             // to upload). Pass an explicit empty defaults slice.
             let clients = build_client_filter_with_defaults(clients, &[]);
+            let cursor_timeout = timeout.map(std::time::Duration::from_secs);
             run_submit_command(
                 clients,
                 since,
@@ -867,6 +969,7 @@ fn main() -> Result<()> {
                 year,
                 dry_run,
                 SubmitMode::Interactive,
+                cursor_timeout,
             )
         }
         Some(Commands::Autosubmit { subcommand }) => {
@@ -890,20 +993,17 @@ fn main() -> Result<()> {
             short,
             agents,
             show_clients,
-            disable_pinned,
             no_spinner: _,
         }) => {
             reject_unsupported_home_override(&cli.home, "wrapped")?;
             let client_filter = build_client_filter(client_flags, &cli.home);
-            run_wrapped_command(
-                output,
-                year,
-                client_filter,
-                short,
-                agents,
-                show_clients,
-                disable_pinned,
-            )
+            run_wrapped_command(output, year, client_filter, short, agents, show_clients)
+        }
+        Some(Commands::Amp { subcommand }) => {
+            reject_unsupported_home_override(&cli.home, "amp")?;
+            match subcommand {
+                AmpSubcommand::Sync { json, timeout } => amp::run_amp_sync(json, timeout),
+            }
         }
         Some(Commands::Cursor { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "cursor")?;
@@ -1129,6 +1229,14 @@ pub enum ClientFilter {
     LmStudio,
     Unsloth,
     Hindsight,
+    #[value(name = "micode-desktop")]
+    MicodeDesktop,
+    Muse,
+    #[value(name = "antigravity-extension")]
+    AntigravityExtension,
+    Aside,
+    Vibe,
+    Proma,
     Synthetic,
 }
 
@@ -1171,6 +1279,7 @@ impl ClientFilter {
             Self::Commandcode => "commandcode",
             Self::Micode => "micode",
             Self::AntigravityCli => "antigravity-cli",
+            Self::AntigravityExtension => "antigravity-extension",
             Self::Junie => "junie",
             Self::Zcode => "zcode",
             Self::Opencodereview => "opencodereview",
@@ -1192,6 +1301,11 @@ impl ClientFilter {
             Self::LmStudio => "lmstudio",
             Self::Unsloth => "unsloth",
             Self::Hindsight => "hindsight",
+            Self::MicodeDesktop => "micode-desktop",
+            Self::Muse => "muse",
+            Self::Aside => "aside",
+            Self::Vibe => "vibe",
+            Self::Proma => "proma",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1237,6 +1351,7 @@ impl ClientFilter {
             Self::Commandcode => Some(ClientId::CommandCode),
             Self::Micode => Some(ClientId::MiMoCode),
             Self::AntigravityCli => Some(ClientId::AntigravityCli),
+            Self::AntigravityExtension => Some(ClientId::AntigravityExtension),
             Self::Junie => Some(ClientId::Junie),
             Self::Zcode => Some(ClientId::Zcode),
             Self::Opencodereview => Some(ClientId::OpenCodeReview),
@@ -1258,6 +1373,11 @@ impl ClientFilter {
             Self::LmStudio => Some(ClientId::LmStudio),
             Self::Unsloth => Some(ClientId::Unsloth),
             Self::Hindsight => Some(ClientId::Hindsight),
+            Self::MicodeDesktop => Some(ClientId::MiMoDesktop),
+            Self::Muse => Some(ClientId::Muse),
+            Self::Aside => Some(ClientId::Aside),
+            Self::Vibe => Some(ClientId::Vibe),
+            Self::Proma => Some(ClientId::Proma),
             Self::Synthetic => None,
         }
     }
@@ -1299,6 +1419,7 @@ impl ClientFilter {
             ClientId::CommandCode => Self::Commandcode,
             ClientId::MiMoCode => Self::Micode,
             ClientId::AntigravityCli => Self::AntigravityCli,
+            ClientId::AntigravityExtension => Self::AntigravityExtension,
             ClientId::Junie => Self::Junie,
             ClientId::Zcode => Self::Zcode,
             ClientId::OpenCodeReview => Self::Opencodereview,
@@ -1320,6 +1441,11 @@ impl ClientFilter {
             ClientId::LmStudio => Self::LmStudio,
             ClientId::Unsloth => Self::Unsloth,
             ClientId::Hindsight => Self::Hindsight,
+            ClientId::MiMoDesktop => Self::MicodeDesktop,
+            ClientId::Muse => Self::Muse,
+            ClientId::Aside => Self::Aside,
+            ClientId::Vibe => Self::Vibe,
+            ClientId::Proma => Self::Proma,
         }
     }
 
@@ -1471,6 +1597,12 @@ fn client_filter_includes_cursor(clients: &Option<Vec<String>>) -> bool {
         .is_none_or(|sources| sources.iter().any(|source| source == "cursor"))
 }
 
+fn client_filter_includes_amp(clients: &Option<Vec<String>>) -> bool {
+    clients
+        .as_ref()
+        .is_none_or(|sources| sources.iter().any(|source| source == "amp"))
+}
+
 fn client_filter_explicitly_requests_cursor(clients: &Option<Vec<String>>) -> bool {
     clients
         .as_ref()
@@ -1510,11 +1642,11 @@ fn cursor_setup_state(home_dir: &Option<String>) -> Option<CursorSetupState> {
     let has_cache = cursor::has_cursor_usage_cache_in_home(&home_path);
     let cache_glob = if home_override {
         home_path
-            .join(".config/tokscale/cursor-cache/usage*.csv")
+            .join(".config/tokscale/cursor-cache/usage*.json")
             .to_string_lossy()
             .to_string()
     } else {
-        "~/.config/tokscale/cursor-cache/usage*.csv".to_string()
+        "~/.config/tokscale/cursor-cache/usage*.json".to_string()
     };
 
     Some(CursorSetupState {
@@ -1692,7 +1824,26 @@ fn should_auto_sync_cursor_for_local_report(
     home_dir: &Option<String>,
     clients: &Option<Vec<String>>,
 ) -> bool {
-    home_dir.is_none() && client_filter_includes_cursor(clients)
+    !tokscale_core::network::is_offline()
+        && home_dir.is_none()
+        && client_filter_includes_cursor(clients)
+}
+
+fn auto_sync_amp_for_local_report(
+    home_dir: &Option<String>,
+    clients: &Option<Vec<String>>,
+) -> Option<amp::AutoSyncAmpResult> {
+    if home_dir.is_some() || !client_filter_includes_amp(clients) {
+        return None;
+    }
+    Some(amp::auto_sync_status())
+}
+
+fn emit_amp_sync_warning(warning: Option<&str>) {
+    if let Some(warning) = warning {
+        use colored::Colorize;
+        eprintln!("{}", warning.yellow());
+    }
 }
 
 fn auto_sync_cursor_for_local_report(
@@ -1700,7 +1851,7 @@ fn auto_sync_cursor_for_local_report(
     clients: &Option<Vec<String>>,
 ) -> Option<cursor::SyncCursorResult> {
     if !should_auto_sync_cursor_for_local_report(home_dir, clients)
-        || !cursor::is_cursor_logged_in()
+        || !cursor::ensure_cursor_session_for_sync()
     {
         return None;
     }
@@ -1818,7 +1969,7 @@ fn model_usage_includes_client(entry: &tokscale_core::ModelUsage, client: &str) 
         .is_some_and(|clients| clients.split(", ").any(|id| id == client))
 }
 
-fn emit_client_diagnostics(diagnostics: &[claude_diagnostics::ClientDiagnostic]) {
+fn emit_client_diagnostics(diagnostics: &[client_diagnostics::ClientDiagnostic]) {
     if diagnostics.is_empty() {
         return;
     }
@@ -1827,7 +1978,8 @@ fn emit_client_diagnostics(diagnostics: &[claude_diagnostics::ClientDiagnostic])
     for diagnostic in diagnostics {
         eprintln!(
             "{}",
-            format!("  {}: {}", diagnostic.severity, diagnostic.message).yellow()
+            format!("  {}: {}", diagnostic.severity, diagnostic.message)
+                .color(client_diagnostics::severity_color(diagnostic.severity))
         );
         eprintln!("{}", format!("  {}", diagnostic.help).bright_black());
     }
@@ -2026,9 +2178,17 @@ impl LightSpinner {
 
             if distance < Self::TRAIL_LENGTH {
                 let color = Self::TRAIL_COLORS[distance.min(Self::TRAIL_COLORS.len() - 1)];
-                out.push_str(&format!("\x1b[38;5;{}m■\x1b[0m", color));
+                out.push_str(&format!(
+                    "\x1b[38;5;{}m{}\x1b[0m",
+                    color,
+                    Glyphs::ascii_safe().scanner_active
+                ));
             } else {
-                out.push_str(&format!("\x1b[38;5;{}m⬝\x1b[0m", Self::INACTIVE_COLOR));
+                out.push_str(&format!(
+                    "\x1b[38;5;{}m{}\x1b[0m",
+                    Self::INACTIVE_COLOR,
+                    Glyphs::ascii_safe().scanner_inactive
+                ));
             }
         }
 
@@ -2225,7 +2385,7 @@ fn run_models_report(
     hide_zero: bool,
 ) -> Result<()> {
     use tokio::runtime::Runtime;
-    use tokscale_core::{get_model_report, GroupBy};
+    use tokscale_core::{get_model_report_v2, GroupBy};
 
     let mut context = LocalReportContext::new(
         home_dir,
@@ -2236,11 +2396,17 @@ fn run_models_report(
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async {
-            get_model_report(context.report_options_with_rollup(group_by.clone(), worktree_rollup))
-                .await
+            get_model_report_v2(
+                context.report_options_with_rollup(group_by.clone(), worktree_rollup),
+            )
+            .await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
-    let mut report = report;
+    let tokscale_core::ModelReportV2 {
+        mut report,
+        undated_tokens,
+        claude_desktop_cache,
+    } = report;
     if hide_zero {
         // Display-only filter: totals were computed in core over the full
         // entry set and intentionally still include the hidden rows.
@@ -2273,7 +2439,7 @@ fn run_models_report(
         .effective_home_dir()
         .as_deref()
         .map(|home| {
-            claude_diagnostics::diagnostics_for_empty_explicit_report(
+            client_diagnostics::diagnostics_for_empty_explicit_report(
                 home,
                 context.use_env_roots,
                 &context.clients,
@@ -2281,6 +2447,8 @@ fn run_models_report(
             )
         })
         .unwrap_or_default();
+
+    let desktop_cache = claude_desktop_cache;
 
     if json {
         #[derive(serde::Serialize)]
@@ -2294,6 +2462,8 @@ fn run_models_report(
             workspace_label: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             session_id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            machine: Option<String>,
             model: String,
             provider: String,
             input: i64,
@@ -2318,10 +2488,13 @@ fn run_models_report(
             total_messages: i32,
             total_cost: f64,
             processing_time_ms: u32,
+            undated_tokens: ModelTokenBreakdownJson,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            claude_desktop_cache: Option<tokscale_core::claude_desktop::Coverage>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             warnings: Vec<String>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
-            diagnostics: Vec<claude_diagnostics::ClientDiagnostic>,
+            diagnostics: Vec<client_diagnostics::ClientDiagnostic>,
         }
 
         let output = ModelReportJson {
@@ -2349,6 +2522,11 @@ fn run_models_report(
                     } else {
                         None
                     },
+                    machine: if group_by == GroupBy::MachineModel {
+                        e.machine
+                    } else {
+                        None
+                    },
                     client: e.client,
                     merged_clients: e.merged_clients,
                     model: e.model,
@@ -2370,6 +2548,8 @@ fn run_models_report(
             total_messages: report.total_messages,
             total_cost: report.total_cost,
             processing_time_ms: report.processing_time_ms,
+            undated_tokens: undated_tokens.into(),
+            claude_desktop_cache: desktop_cache,
             warnings: context.cursor_setup_warnings,
             diagnostics,
         };
@@ -2377,6 +2557,18 @@ fn run_models_report(
     } else {
         use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
         emit_client_diagnostics(&diagnostics);
+
+        if undated_tokens.total() > 0 {
+            eprintln!("  Claude Desktop: {} tokens included in all-time totals have no known usage date. They are excluded from dated reports and submissions.", undated_tokens.total());
+        }
+        if let Some(coverage) = desktop_cache {
+            if coverage.decode_errors > 0 {
+                eprintln!(
+                    "  Claude Desktop: {} cache read/decode errors; cached totals are incomplete.",
+                    coverage.decode_errors
+                );
+            }
+        }
 
         emit_cursor_setup_warnings(&context.cursor_setup_warnings);
         let total_performance = aggregate_model_report_performance(&report.entries);
@@ -2396,6 +2588,22 @@ fn run_models_report(
         table.enforce_styling();
 
         let workspace_name = |label: Option<&str>| label.unwrap_or("Unknown workspace").to_string();
+        // `workspace,model` and `machine,model` share one layout; only the
+        // first column differs.
+        let label_header = if group_by == GroupBy::MachineModel {
+            "Machine"
+        } else {
+            "Workspace"
+        };
+        let row_label = |entry: &tokscale_core::ModelUsage| {
+            if group_by == GroupBy::MachineModel {
+                entry.machine.clone().unwrap_or_else(|| {
+                    tokscale_core::machine_label::DEFAULT_LOCAL_MACHINE_LABEL.to_string()
+                })
+            } else {
+                workspace_name(entry.workspace_label.as_deref())
+            }
+        };
 
         if compact {
             match group_by {
@@ -2615,9 +2823,9 @@ fn run_models_report(
                     );
                     table.add_row(total_row);
                 }
-                GroupBy::WorkspaceModel => {
+                GroupBy::WorkspaceModel | GroupBy::MachineModel => {
                     table.set_header(vec![
-                        Cell::new("Workspace").fg(Color::Cyan),
+                        Cell::new(label_header).fg(Color::Cyan),
                         Cell::new("Model").fg(Color::Cyan),
                         Cell::new("ms/1K").fg(Color::Cyan),
                         Cell::new("Cost").fg(Color::Cyan),
@@ -2625,7 +2833,7 @@ fn run_models_report(
 
                     for entry in &report.entries {
                         table.add_row(vec![
-                            Cell::new(workspace_name(entry.workspace_label.as_deref())),
+                            Cell::new(row_label(entry)),
                             Cell::new(&entry.model),
                             Cell::new(format_ms_per_1k(entry.performance.ms_per_1k_tokens))
                                 .set_alignment(CellAlignment::Right),
@@ -2930,9 +3138,9 @@ fn run_models_report(
                             .set_alignment(CellAlignment::Right),
                     ]);
                 }
-                GroupBy::WorkspaceModel => {
+                GroupBy::WorkspaceModel | GroupBy::MachineModel => {
                     table.set_header(vec![
-                        Cell::new("Workspace").fg(Color::Cyan),
+                        Cell::new(label_header).fg(Color::Cyan),
                         Cell::new("Providers").fg(Color::Cyan),
                         Cell::new("Sources").fg(Color::Cyan),
                         Cell::new("Model").fg(Color::Cyan),
@@ -2960,7 +3168,7 @@ fn run_models_report(
                             .join(", ");
 
                         table.add_row(vec![
-                            Cell::new(workspace_name(entry.workspace_label.as_deref())),
+                            Cell::new(row_label(entry)),
                             Cell::new(crate::tui::ui::widgets::get_provider_display_name(
                                 &entry.provider,
                             ))
@@ -3667,7 +3875,6 @@ fn run_wrapped_command(
     short: bool,
     agents: bool,
     show_clients: bool,
-    disable_pinned: bool,
 ) -> Result<()> {
     use colored::Colorize;
 
@@ -3683,7 +3890,6 @@ fn run_wrapped_command(
         clients: client_filter,
         short,
         include_agents,
-        pin_sisyphus: !disable_pinned,
     };
 
     match commands::wrapped::run(wrapped_options) {
@@ -3707,6 +3913,8 @@ fn run_pricing_lookup(
     model_id: &str,
     json: bool,
     provider: Option<&str>,
+    billing_provider: Option<&str>,
+    strict: bool,
     no_spinner: bool,
 ) -> Result<()> {
     use colored::Colorize;
@@ -3715,8 +3923,111 @@ fn run_pricing_lookup(
     use tokio::runtime::Runtime;
     use tokscale_core::pricing::PricingService;
 
+    if model_id.eq_ignore_ascii_case("refresh") {
+        if provider.is_some() || billing_provider.is_some() || strict {
+            anyhow::bail!(
+                "pricing refresh does not accept model query or override-validation options"
+            );
+        }
+        let report = Runtime::new()?
+            .block_on(PricingService::refresh())
+            .map_err(anyhow::Error::msg)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            for source in &report.sources {
+                if let Some(error) = &source.error {
+                    eprintln!("{}: {}", source.source, error);
+                } else {
+                    println!("{}: cached {} models", source.source, source.models);
+                }
+            }
+        }
+        if !report.succeeded() {
+            anyhow::bail!(
+                "Some pricing catalogs could not be refreshed; previous caches were retained"
+            );
+        }
+        return Ok(());
+    }
+
+    // An explicitly supplied invalid channel must not become "no filter".
+    // Validate before loading configuration or enumerating local usage rows.
+    let billing_provider = billing_provider
+        .map(|raw| {
+            tokscale_core::sessions::normalize_billing_provider(raw).ok_or_else(|| {
+                anyhow::anyhow!("--billing-provider must be nonempty and cannot be \"unknown\"")
+            })
+        })
+        .transpose()?;
+    let billing_provider = billing_provider.as_deref();
+
     if model_id.eq_ignore_ascii_case("list-overrides") {
         return run_pricing_list_overrides(json);
+    }
+
+    if model_id.eq_ignore_ascii_case("validate-overrides") {
+        let overrides = tokscale_core::pricing::custom::CustomPricing::load_from_default_path();
+        let valid = overrides.diagnostics().is_empty();
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"valid": valid, "count": overrides.len(), "diagnostics": overrides.diagnostics()})
+                )?
+            );
+        } else {
+            println!(
+                "Custom pricing: {} ({} usable rules)",
+                if valid { "valid" } else { "invalid" },
+                overrides.len()
+            );
+        }
+        if strict && !valid {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if model_id.eq_ignore_ascii_case("explain") {
+        if provider.is_some() {
+            anyhow::bail!("--source/--provider applies to model queries; explain reports the active local pricing configuration");
+        }
+        let svc = PricingService::load_cached_any_age().unwrap_or_else(|| {
+            PricingService::new_with_custom(
+                tokscale_core::pricing::custom::CustomPricing::load_from_default_path(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+        });
+        let messages = Runtime::new()?
+            .block_on(tokscale_core::parse_local_unified_messages_with_pricing(
+                tokscale_core::LocalParseOptions {
+                    use_env_roots: true,
+                    ..Default::default()
+                },
+                Some(&svc),
+            ))
+            .map_err(anyhow::Error::msg)?;
+        let explanations: Vec<_> = messages
+            .iter()
+            .filter(|message| {
+                billing_provider.is_none_or(|id| message.billing_identity.id() == Some(id))
+            })
+            .map(|message| svc.explain_message(message))
+            .collect();
+        if json {
+            println!("{}", serde_json::to_string_pretty(&explanations)?);
+        } else {
+            for row in explanations {
+                print!("{} / {} billing={} {:?}: ${:.8} source={} scope={} matched={} normalized={} base ×{} coverage={}", row.client, row.raw_model_id, row.billing_provider_id.as_deref().unwrap_or("unknown"), row.estimate_status, row.final_estimate, row.price_source.as_deref().unwrap_or("unpriced"), row.scope, row.matched_model_id.as_deref().unwrap_or("none"), row.normalized, row.effective_multiplier, row.coverage);
+                if !row.coverage && !row.uncovered_buckets.is_empty() {
+                    print!(" uncovered={}", row.uncovered_buckets.join(","));
+                }
+                println!();
+            }
+        }
+        return Ok(());
     }
 
     let provider_normalized = provider.map(|p| p.to_lowercase());
@@ -3747,8 +4058,27 @@ fn run_pricing_lookup(
 
     let rt = Runtime::new()?;
     let result = match rt.block_on(async {
+        // A billing label selects custom rules, not a public catalog namespace.
+        let context = tokscale_core::pricing::PricingContext {
+            upstream_hint: None,
+            ..tokscale_core::pricing::PricingContext::explicit(model_id, billing_provider)
+        };
+        // A private custom-only query must not contact public catalogs.
+        let local = PricingService::new_with_custom(
+            tokscale_core::pricing::custom::CustomPricing::load_from_default_path(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+        if provider_normalized.as_deref() == Some("custom") {
+            return Ok::<_, String>(local.lookup_context(&context, Some("custom")));
+        }
+        if provider_normalized.is_none() {
+            if let Some(result) = local.lookup_context(&context, Some("custom")) {
+                return Ok(Some(result));
+            }
+        }
         let svc = PricingService::get_or_init().await?;
-        Ok::<_, String>(svc.lookup_with_source(model_id, provider_normalized.as_deref()))
+        Ok::<_, String>(svc.lookup_context(&context, provider_normalized.as_deref()))
     }) {
         Ok(result) => result,
         Err(err) => {
@@ -3799,6 +4129,12 @@ fn run_pricing_lookup(
                     model_id: String,
                     matched_key: String,
                     source: String,
+                    billing_provider_id: Option<String>,
+                    scope: &'static str,
+                    matched_provider_id: Option<String>,
+                    rate_basis: &'static str,
+                    missing_rates: Vec<&'static str>,
+                    all_rates: tokscale_core::pricing::ModelPricing,
                     resolution: ResolutionOutput,
                     pricing: PricingValues,
                 }
@@ -3818,6 +4154,35 @@ fn run_pricing_lookup(
 
                 let output = PricingOutput {
                     model_id: model_id.to_string(),
+                    billing_provider_id: billing_provider
+                        .and_then(tokscale_core::sessions::normalize_billing_provider),
+                    scope: if pricing.source == "Custom" {
+                        if pricing.matched_provider_id.is_some() {
+                            "provider"
+                        } else {
+                            "global"
+                        }
+                    } else {
+                        "upstream"
+                    },
+                    matched_provider_id: pricing.matched_provider_id,
+                    rate_basis: "base",
+                    missing_rates: {
+                        let mut missing = Vec::new();
+                        if pricing.pricing.input_cost_per_token.is_none() {
+                            missing.push("input");
+                        }
+                        if pricing.pricing.output_cost_per_token.is_none() {
+                            missing.push("output");
+                        }
+                        if pricing.pricing.cache_read_input_token_cost.is_some()
+                            && pricing.pricing.cache_creation_input_token_cost.is_none()
+                        {
+                            missing.push("cache_creation");
+                        }
+                        missing
+                    },
+                    all_rates: pricing.pricing.clone(),
                     matched_key: pricing.matched_key,
                     source: pricing.source,
                     resolution: ResolutionOutput {
@@ -3864,6 +4229,16 @@ fn run_pricing_lookup(
             Some(pricing) => {
                 println!("\n  Pricing for: {}", model_id.bold());
                 println!("  Matched key: {}", pricing.matched_key);
+                println!(
+                    "  Scope: {} (base rates)",
+                    pricing.matched_provider_id.as_deref().unwrap_or(
+                        if pricing.source == "Custom" {
+                            "global"
+                        } else {
+                            "upstream"
+                        }
+                    )
+                );
                 let source_label = match pricing.source.to_lowercase().as_str() {
                     "custom" => "Custom",
                     "litellm" => "LiteLLM",
@@ -3936,6 +4311,9 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     #[serde(rename_all = "camelCase")]
     struct OverrideEntry {
         model_id: String,
+        provider_id: Option<String>,
+        scope: &'static str,
+        rates: ModelPricing,
         #[serde(skip_serializing_if = "Option::is_none")]
         input_cost_per_million_tokens: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -3946,9 +4324,16 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
         cache_creation_input_token_cost_per_million_tokens: Option<f64>,
     }
 
-    fn entry(model_id: &str, pricing: &ModelPricing) -> OverrideEntry {
+    fn entry(provider_id: Option<&str>, model_id: &str, pricing: &ModelPricing) -> OverrideEntry {
         OverrideEntry {
             model_id: model_id.to_string(),
+            provider_id: provider_id.map(str::to_string),
+            scope: if provider_id.is_some() {
+                "provider"
+            } else {
+                "global"
+            },
+            rates: pricing.clone(),
             input_cost_per_million_tokens: per_million(pricing.input_cost_per_token),
             output_cost_per_million_tokens: per_million(pricing.output_cost_per_token),
             cache_read_input_token_cost_per_million_tokens: per_million(
@@ -3963,10 +4348,10 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     let path = CustomPricing::default_path();
     let overrides = CustomPricing::load_from_path(&path);
     let mut entries: Vec<OverrideEntry> = overrides
-        .entries()
-        .map(|(model_id, pricing)| entry(model_id, pricing))
+        .all_entries()
+        .map(|(provider_id, model_id, pricing)| entry(provider_id, model_id, pricing))
         .collect();
-    entries.sort_by(|a, b| a.model_id.cmp(&b.model_id));
+    entries.sort_by(|a, b| (&a.provider_id, &a.model_id).cmp(&(&b.provider_id, &b.model_id)));
 
     if json {
         #[derive(serde::Serialize)]
@@ -4003,7 +4388,11 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     println!();
 
     for entry in entries {
-        println!("  {}", entry.model_id.bold());
+        println!(
+            "  {} [{}]",
+            entry.model_id.bold(),
+            entry.provider_id.as_deref().unwrap_or("Global")
+        );
         if let Some(input) = entry.input_cost_per_million_tokens {
             println!("    Input:  ${} / 1M tokens", format_per_million(input));
         }
@@ -4085,13 +4474,19 @@ fn format_currency(n: f64) -> String {
     format!("${:.2}", n)
 }
 
+/// Blended cost per 1M tokens for a report row. A positive rate that `{:.2}`
+/// would round to `$0.00` renders as `<$0.01/M` instead: the report tables are
+/// fixed-width, so the honest alternative to a lost digit is a bound, not the
+/// escalating decimals [`format_per_million`] uses for published sheet prices.
 fn format_cost_per_million(cost: f64, total_tokens: i64) -> String {
-    if total_tokens <= 0 || !cost.is_finite() {
+    if total_tokens <= 0 || !cost.is_finite() || cost < 0.0 {
         return "—".to_string();
     }
     let cost_per_m = cost * 1_000_000.0 / total_tokens as f64;
     if !cost_per_m.is_finite() {
         "—".to_string()
+    } else if cost > 0.0 && cost_per_m < 0.01 {
+        "<$0.01/M".to_string()
     } else {
         format!("${:.2}/M", cost_per_m)
     }
@@ -4250,8 +4645,8 @@ fn capitalize_client(client: &str) -> String {
 
 fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
     use tokscale_core::{
-        built_in_extra_scan_paths_for, extra_scan_paths_for, parse_local_clients, ClientId,
-        LocalParseOptions,
+        built_in_extra_scan_paths_for, extra_scan_paths_for, parse_local_clients,
+        sessions::codex::CODEX_HEADLESS_AGENT, ClientId, LocalParseOptions,
     };
 
     let explicit_home_dir = home_dir;
@@ -4302,7 +4697,7 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         extra_paths: Vec<ExtraPath>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        diagnostics: Vec<claude_diagnostics::ClientDiagnostic>,
+        diagnostics: Vec<client_diagnostics::ClientDiagnostic>,
     }
 
     #[derive(serde::Serialize)]
@@ -4347,206 +4742,207 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
     let copilot_exporter_path =
         tokscale_core::copilot_exporter_path_with_env_strategy(use_env_roots);
 
-    let clients: Vec<ClientRow> =
-        ClientId::iter()
-            .map(|client| {
-                let prime_agent_roots = (client == ClientId::PrimeAgent).then(|| {
-                    tokscale_core::scanner::prime_agent_session_roots_with_env_strategy(
-                        &home_dir_str,
-                        use_env_roots,
-                    )
+    let clients: Vec<ClientRow> = ClientId::iter()
+        .map(|client| {
+            let prime_agent_roots = (client == ClientId::PrimeAgent).then(|| {
+                tokscale_core::scanner::prime_agent_session_roots_with_env_strategy(
+                    &home_dir_str,
+                    use_env_roots,
+                )
+            });
+            let sessions_path = prime_agent_roots
+                .as_ref()
+                .map(|roots| roots[0].to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    client
+                        .data()
+                        .resolve_path_with_env_strategy(&home_dir_str, use_env_roots)
                 });
-                let sessions_path = prime_agent_roots
-                    .as_ref()
-                    .map(|roots| roots[0].to_string_lossy().into_owned())
-                    .unwrap_or_else(|| {
-                        client
-                            .data()
-                            .resolve_path_with_env_strategy(&home_dir_str, use_env_roots)
-                    });
-                let sessions_path_exists = Path::new(&sessions_path).exists();
-                let mut additional_paths: Vec<AdditionalPath> = built_in_extra_paths
-                    .iter()
-                    .filter(|(c, _)| *c == client)
-                    .map(|(_, path)| AdditionalPath {
-                        path: path.to_string_lossy().to_string(),
-                        exists: path.exists(),
-                    })
-                    .collect();
-                if let Some(roots) = &prime_agent_roots {
-                    additional_paths.push(AdditionalPath {
-                        path: roots[1].to_string_lossy().into_owned(),
-                        exists: roots[1].exists(),
-                    });
-                }
-                if client == ClientId::Zcode {
-                    let path = home_dir.join(".zcode/cli/db/db.sqlite");
-                    additional_paths.push(AdditionalPath {
-                        path: path.to_string_lossy().to_string(),
-                        exists: path.exists(),
-                    });
-                }
-                if client == ClientId::OpenClaw {
-                    // Current OpenClaw keeps live transcripts in per-agent
-                    // SQLite stores beside the legacy JSONL session dirs.
-                    // List them from every agents root the scanner ingests:
-                    // the default root, the legacy rebrand roots, and the
-                    // configured extra roots.
-                    let mut openclaw_roots: Vec<std::path::PathBuf> =
-                        vec![std::path::PathBuf::from(&sessions_path)];
-                    openclaw_roots.extend(
-                        [".clawdbot/agents", ".moltbot/agents", ".moldbot/agents"]
-                            .iter()
-                            .map(|relative| home_dir.join(relative)),
-                    );
-                    openclaw_roots.extend(
-                        settings_extra_dirs
-                            .iter()
-                            .filter(|(c, _)| *c == ClientId::OpenClaw)
-                            .map(|(_, path)| path.clone()),
-                    );
-                    openclaw_roots.extend(
-                        extra_dirs
-                            .iter()
-                            .filter(|(c, _)| *c == ClientId::OpenClaw)
-                            .map(|(_, path)| std::path::PathBuf::from(path)),
-                    );
-                    let mut seen_openclaw_dbs = std::collections::HashSet::new();
-                    for root in openclaw_roots {
-                        for db_path in tokscale_core::scanner::discover_openclaw_agent_dbs(&root) {
-                            let key =
-                                std::fs::canonicalize(&db_path).unwrap_or_else(|_| db_path.clone());
-                            if seen_openclaw_dbs.insert(key) {
-                                additional_paths.push(AdditionalPath {
-                                    path: db_path.to_string_lossy().to_string(),
-                                    exists: true,
-                                });
-                            }
-                        }
-                    }
-                }
-                if client == ClientId::DevinDesktop {
-                    for root in tokscale_core::scanner::devin_desktop_additional_roots(
-                        &home_dir_str,
-                        use_env_roots,
-                    ) {
-                        let path_str = root.to_string_lossy().to_string();
-                        if !additional_paths.iter().any(|p| p.path == path_str) {
+            let sessions_path_exists = Path::new(&sessions_path).exists();
+            let mut additional_paths: Vec<AdditionalPath> = built_in_extra_paths
+                .iter()
+                .filter(|(c, _)| *c == client)
+                .map(|(_, path)| AdditionalPath {
+                    path: path.to_string_lossy().to_string(),
+                    exists: path.exists(),
+                })
+                .collect();
+            if let Some(roots) = &prime_agent_roots {
+                additional_paths.push(AdditionalPath {
+                    path: roots[1].to_string_lossy().into_owned(),
+                    exists: roots[1].exists(),
+                });
+            }
+            if client == ClientId::Zcode {
+                let path = home_dir.join(".zcode/cli/db/db.sqlite");
+                additional_paths.push(AdditionalPath {
+                    path: path.to_string_lossy().to_string(),
+                    exists: path.exists(),
+                });
+            }
+            if client == ClientId::OpenClaw {
+                // Current OpenClaw keeps live transcripts in per-agent
+                // SQLite stores beside the legacy JSONL session dirs.
+                // List them from every agents root the scanner ingests:
+                // the default root, the legacy rebrand roots, and the
+                // configured extra roots.
+                let mut openclaw_roots: Vec<std::path::PathBuf> =
+                    vec![std::path::PathBuf::from(&sessions_path)];
+                openclaw_roots.extend(
+                    [".clawdbot/agents", ".moltbot/agents", ".moldbot/agents"]
+                        .iter()
+                        .map(|relative| home_dir.join(relative)),
+                );
+                openclaw_roots.extend(
+                    settings_extra_dirs
+                        .iter()
+                        .filter(|(c, _)| *c == ClientId::OpenClaw)
+                        .map(|(_, path)| path.clone()),
+                );
+                openclaw_roots.extend(
+                    extra_dirs
+                        .iter()
+                        .filter(|(c, _)| *c == ClientId::OpenClaw)
+                        .map(|(_, path)| std::path::PathBuf::from(path)),
+                );
+                let mut seen_openclaw_dbs = std::collections::HashSet::new();
+                for root in openclaw_roots {
+                    for db_path in tokscale_core::scanner::discover_openclaw_agent_dbs(&root) {
+                        let key =
+                            std::fs::canonicalize(&db_path).unwrap_or_else(|_| db_path.clone());
+                        if seen_openclaw_dbs.insert(key) {
                             additional_paths.push(AdditionalPath {
-                                path: path_str,
-                                exists: root.exists(),
+                                path: db_path.to_string_lossy().to_string(),
+                                exists: true,
                             });
                         }
                     }
                 }
-                let legacy_paths = if client == ClientId::OpenClaw {
-                    vec![
-                        LegacyPath {
-                            path: home_dir
-                                .join(".clawdbot/agents")
-                                .to_string_lossy()
-                                .to_string(),
-                            exists: home_dir.join(".clawdbot/agents").exists(),
-                        },
-                        LegacyPath {
-                            path: home_dir
-                                .join(".moltbot/agents")
-                                .to_string_lossy()
-                                .to_string(),
-                            exists: home_dir.join(".moltbot/agents").exists(),
-                        },
-                        LegacyPath {
-                            path: home_dir
-                                .join(".moldbot/agents")
-                                .to_string_lossy()
-                                .to_string(),
-                            exists: home_dir.join(".moldbot/agents").exists(),
-                        },
-                    ]
-                } else {
-                    vec![]
-                };
-                let (headless_supported, headless_paths, headless_message_count) =
-                    if client.supports_headless() {
-                        (
-                            true,
-                            headless_roots
-                                .iter()
-                                .map(|root| {
-                                    let path = root.join(client.as_str());
-                                    HeadlessPath {
-                                        path: path.to_string_lossy().to_string(),
-                                        exists: path.exists(),
-                                    }
-                                })
-                                .collect(),
-                            parsed
-                                .messages
-                                .iter()
-                                .filter(|message| {
-                                    message.agent.as_deref() == Some("headless")
-                                        && message.client == client.as_str()
-                                })
-                                .count() as i32,
-                        )
-                    } else {
-                        (false, vec![], 0)
-                    };
-
-                let label = match client {
-                    ClientId::Claude => "Claude Code",
-                    ClientId::Codex => "Codex CLI",
-                    ClientId::Copilot => "Copilot CLI",
-                    ClientId::Gemini => "Gemini CLI",
-                    ClientId::Cursor => "Cursor IDE",
-                    ClientId::Kimi => "Kimi CLI",
-                    ClientId::AntigravityCli => "Antigravity CLI",
-                    _ => client_ui::display_name(client),
+            }
+            if client == ClientId::DevinDesktop {
+                for root in tokscale_core::scanner::devin_desktop_additional_roots(
+                    &home_dir_str,
+                    use_env_roots,
+                ) {
+                    let path_str = root.to_string_lossy().to_string();
+                    if !additional_paths.iter().any(|p| p.path == path_str) {
+                        additional_paths.push(AdditionalPath {
+                            path: path_str,
+                            exists: root.exists(),
+                        });
+                    }
                 }
-                .to_string();
+            }
+            let legacy_paths = if client == ClientId::OpenClaw {
+                vec![
+                    LegacyPath {
+                        path: home_dir
+                            .join(".clawdbot/agents")
+                            .to_string_lossy()
+                            .to_string(),
+                        exists: home_dir.join(".clawdbot/agents").exists(),
+                    },
+                    LegacyPath {
+                        path: home_dir
+                            .join(".moltbot/agents")
+                            .to_string_lossy()
+                            .to_string(),
+                        exists: home_dir.join(".moltbot/agents").exists(),
+                    },
+                    LegacyPath {
+                        path: home_dir
+                            .join(".moldbot/agents")
+                            .to_string_lossy()
+                            .to_string(),
+                        exists: home_dir.join(".moldbot/agents").exists(),
+                    },
+                ]
+            } else {
+                vec![]
+            };
+            let (headless_supported, headless_paths, headless_message_count) =
+                if client.supports_headless() {
+                    (
+                        true,
+                        headless_roots
+                            .iter()
+                            .map(|root| {
+                                let path = root.join(client.as_str());
+                                HeadlessPath {
+                                    path: path.to_string_lossy().to_string(),
+                                    exists: path.exists(),
+                                }
+                            })
+                            .collect(),
+                        parsed
+                            .messages
+                            .iter()
+                            .filter(|message| {
+                                matches!(
+                                    message.agent.as_deref(),
+                                    Some("headless" | CODEX_HEADLESS_AGENT)
+                                ) && message.client == client.as_str()
+                            })
+                            .count() as i32,
+                    )
+                } else {
+                    (false, vec![], 0)
+                };
 
-                let mut extra_paths: Vec<ExtraPath> = settings_extra_dirs
+            let label = match client {
+                ClientId::Claude => "Claude Code",
+                ClientId::Codex => "Codex CLI",
+                ClientId::Copilot => "Copilot CLI",
+                ClientId::Gemini => "Gemini CLI",
+                ClientId::Cursor => "Cursor IDE",
+                ClientId::Kimi => "Kimi CLI",
+                ClientId::AntigravityCli => "Antigravity CLI",
+                ClientId::AntigravityExtension => "Antigravity IDE Extension",
+                _ => client_ui::display_name(client),
+            }
+            .to_string();
+
+            let mut extra_paths: Vec<ExtraPath> = settings_extra_dirs
+                .iter()
+                .filter(|(c, _)| *c == client)
+                .map(|(_, path)| ExtraPath {
+                    path: path.to_string_lossy().to_string(),
+                    exists: path.exists(),
+                    source: "settings".to_string(),
+                })
+                .collect();
+            extra_paths.extend(
+                extra_dirs
                     .iter()
                     .filter(|(c, _)| *c == client)
                     .map(|(_, path)| ExtraPath {
-                        path: path.to_string_lossy().to_string(),
-                        exists: path.exists(),
-                        source: "settings".to_string(),
-                    })
-                    .collect();
-                extra_paths.extend(extra_dirs.iter().filter(|(c, _)| *c == client).map(
-                    |(_, path)| ExtraPath {
                         path: path.clone(),
                         exists: Path::new(path).exists(),
                         source: "env".to_string(),
-                    },
-                ));
+                    }),
+            );
 
-                let diagnostics = if client == ClientId::Claude {
-                    claude_diagnostics::diagnostics_for_clients_row(&home_dir, use_env_roots)
-                } else {
-                    Vec::new()
-                };
+            let diagnostics =
+                client_diagnostics::diagnostics_for_clients_row(client, &home_dir, use_env_roots);
 
-                ClientRow {
-                    client: client.as_str().to_string(),
-                    label,
-                    sessions_path,
-                    sessions_path_exists,
-                    additional_paths,
-                    legacy_paths,
-                    message_count: parsed.counts.get(client),
-                    headless_supported,
-                    headless_paths,
-                    headless_message_count,
-                    exporter_status: (client == ClientId::Copilot
-                        && copilot_exporter_path.is_some())
+            ClientRow {
+                client: client.as_str().to_string(),
+                label,
+                sessions_path,
+                sessions_path_exists,
+                additional_paths,
+                legacy_paths,
+                message_count: parsed.counts.get(client),
+                headless_supported,
+                headless_paths,
+                headless_message_count,
+                exporter_status: (client == ClientId::Copilot && copilot_exporter_path.is_some())
                     .then(|| "configured".to_string()),
-                    extra_paths,
-                    diagnostics,
-                }
-            })
-            .collect();
+                extra_paths,
+                diagnostics,
+            }
+        })
+        .collect();
 
     if json {
         #[derive(serde::Serialize)]
@@ -4684,7 +5080,8 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
             for diagnostic in &row.diagnostics {
                 println!(
                     "  {}",
-                    format!("{}: {}", diagnostic.severity, diagnostic.message).yellow()
+                    format!("{}: {}", diagnostic.severity, diagnostic.message)
+                        .color(client_diagnostics::severity_color(diagnostic.severity))
                 );
                 println!("  {}", diagnostic.help.bright_black());
             }
@@ -4740,6 +5137,30 @@ fn format_number(n: i32) -> String {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ModelTokenBreakdownJson {
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cache_write_1h: i64,
+    reasoning: i64,
+}
+
+impl From<tokscale_core::TokenBreakdown> for ModelTokenBreakdownJson {
+    fn from(tokens: tokscale_core::TokenBreakdown) -> Self {
+        Self {
+            input: tokens.input,
+            output: tokens.output,
+            cache_read: tokens.cache_read,
+            cache_write: tokens.cache_write,
+            cache_write_1h: tokens.cache_write_1h,
+            reasoning: tokens.reasoning,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TsTokenBreakdown {
     input: i64,
     output: i64,
@@ -4758,6 +5179,8 @@ struct TsSourceContribution {
     tokens: TsTokenBreakdown,
     cost: f64,
     messages: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(serde::Serialize)]
@@ -4770,6 +5193,8 @@ struct TsDailyTotals {
     /// predate #1044. Only incomplete days pay a wire-format cost.
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_is_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(serde::Serialize)]
@@ -4797,6 +5222,8 @@ struct TsYearSummary {
     total_tokens: i64,
     total_cost: f64,
     range: DateRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(serde::Serialize)]
@@ -4810,6 +5237,8 @@ struct TsDataSummary {
     max_cost_in_single_day: f64,
     clients: Vec<String>,
     models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(serde::Serialize)]
@@ -4839,12 +5268,200 @@ struct TsTimeMetrics {
 
 const SUBMISSION_PARSER_VERSION: u32 = 1;
 const COPILOT_SUBMISSION_PARSER_VERSION: u32 = 2;
+// Amp v2 moves existing exported messages from synthesized creation-time dates
+// to the server-provided usage timestamp. The receiver replaces the complete
+// Amp daily layout at this generation, preserving lifetime totals.
+const AMP_SUBMISSION_PARSER_VERSION: u32 = 2;
+// The receiver admits the MiMo CLI/desktop split atomically only when both
+// selected surfaces declare this generation and cover the credited history.
+// This is a submission contract, independent of the on-disk parser cache version.
+const MICODE_SUBMISSION_PARSER_VERSION: u32 = 2;
+// Devin CLI generation 2 deduplicates `message_nodes` rows by request_id
+// instead of row_id (ea4dd97e, parser cache v3->v4). That generation counts
+// the same history strictly LOWER, which no monotonic receiver ledger can
+// follow on its own. The scan therefore also ships a per-day recount proof
+// (`TsScanScope::recount_proofs`) built from the same rows, and the receiver
+// subtracts only the proven over-count from its stored cells. The receiver
+// accepts generation 1 only until a device starts this transition, then
+// freezes every older submit.
+const DEVIN_CLI_SUBMISSION_PARSER_VERSION: u32 = 2;
+/// Cursor generation 2 collapses repeated `usageEventId` snapshots (and the
+/// matching legacy id-less row) once per cache file. The raw rows remain in the
+/// parser cache so the scan can ship the same per-day recount proof used for
+/// Devin CLI; generation 1 stays accepted only until a device transitions.
+const CURSOR_SUBMISSION_PARSER_VERSION: u32 = 2;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsRecountProofCell {
+    tokens: TsTokenBreakdown,
+    cost: f64,
+    messages: i32,
+}
+
+impl From<&tokscale_core::RecountProofCell> for TsRecountProofCell {
+    fn from(cell: &tokscale_core::RecountProofCell) -> Self {
+        Self {
+            tokens: TsTokenBreakdown {
+                input: cell.tokens.input,
+                output: cell.tokens.output,
+                cache_read: cell.tokens.cache_read,
+                cache_write: cell.tokens.cache_write,
+                reasoning: cell.tokens.reasoning,
+            },
+            cost: cell.cost,
+            messages: cell.messages,
+        }
+    }
+}
+
+/// What the previous and the declared parser generation count for one
+/// (day, model) cell from the same local rows. See `recount_proofs` below.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsRecountProofEntry {
+    previous: TsRecountProofCell,
+    corrected: TsRecountProofCell,
+}
+
+/// `client -> date -> model id -> proof`.
+type TsRecountProofs = std::collections::BTreeMap<
+    String,
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, TsRecountProofEntry>>,
+>;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsScanScope {
     parser_versions: std::collections::BTreeMap<String, u32>,
     full_history: bool,
+    full_history_clients: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention_floors: Option<std::collections::BTreeMap<String, String>>,
+    /// Per-day correction evidence for clients whose declared generation
+    /// counts the same history LOWER than the one the receiver may have
+    /// stored (Devin CLI request dedup and Cursor event-snapshot collapse). A
+    /// generation number alone only proves identity. This proves how much the
+    /// older generation over-counted each cell from the exact rows that built
+    /// this snapshot, so
+    /// the receiver subtracts that difference instead of replacing the cell.
+    /// Only sent for clients carrying full-history authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recount_proofs: Option<TsRecountProofs>,
+}
+
+/// Strip full-history authority from clients whose history this scan could
+/// only partially read.
+///
+/// `full_history` so far meant "no date filter was passed". A client whose
+/// session sources partly failed to open satisfies that and still reports less
+/// than it has, and on the receiver a full-history snapshot is what may
+/// rewrite or re-baseline stored history. Withholding the bit keeps those
+/// stored rows untouched until a later scan reads everything.
+fn withhold_full_history_for_clients(
+    scope: &mut TsScanScope,
+    incomplete_clients: &std::collections::BTreeSet<String>,
+) {
+    if incomplete_clients.is_empty() {
+        return;
+    }
+    let declared = scope.parser_versions.len();
+    scope
+        .full_history_clients
+        .retain(|client| !incomplete_clients.contains(client));
+    scope.full_history = scope.full_history && scope.full_history_clients.len() == declared;
+}
+
+/// Clients whose discovered session sources were not all readable.
+fn incompletely_read_clients(
+    source_reads: &std::collections::BTreeMap<String, tokscale_core::SourceReadSummary>,
+) -> std::collections::BTreeSet<String> {
+    source_reads
+        .iter()
+        .filter(|(_, summary)| !summary.complete())
+        .map(|(client, _)| client.clone())
+        .collect()
+}
+
+/// True when the corrected side of one proof cell is empty: the previous
+/// generation counted rows that this generation drops entirely, so the
+/// submission has no contribution for this (day, model) cell.
+fn recount_proof_cell_is_all_duplicates(entry: &tokscale_core::RecountProofEntry) -> bool {
+    let tokens = &entry.corrected.tokens;
+    tokens.input == 0
+        && tokens.output == 0
+        && tokens.cache_read == 0
+        && tokens.cache_write == 0
+        && tokens.cache_write_1h == 0
+        && tokens.reasoning == 0
+        && entry.corrected.cost == 0.0
+        && entry.corrected.messages == 0
+}
+
+/// Recount proofs for the clients that carry full-history authority in
+/// `scope`, limited to the (day, model) cells the submission actually carries
+/// plus cells whose every row the corrected generation drops. The latter have
+/// no contribution to submit, yet their stored over-count is exactly what the
+/// proof exists to heal. Filtering at model granularity also removes a
+/// tokenless-cost row that submission excluded from a day where another model
+/// still has usage.
+fn submission_recount_proofs(
+    graph: &tokscale_core::GraphResultV2,
+    scope: &TsScanScope,
+) -> Option<TsRecountProofs> {
+    let mut proofs = TsRecountProofs::new();
+    for (client, proof) in &graph.recount_proofs {
+        if !scope.full_history && !scope.full_history_clients.iter().any(|c| c == client) {
+            continue;
+        }
+        let submitted_cells: std::collections::BTreeSet<(&str, &str)> = graph
+            .contributions
+            .iter()
+            .flat_map(|day| {
+                day.clients
+                    .iter()
+                    .filter(|submission| &submission.client == client)
+                    .map(|submission| (day.date.as_str(), submission.model_id.as_str()))
+            })
+            .collect();
+        let days: std::collections::BTreeMap<_, _> = proof
+            .iter()
+            .filter_map(|(date, models)| {
+                let models: std::collections::BTreeMap<_, _> = models
+                    .iter()
+                    .filter(|(model_id, entry)| {
+                        submitted_cells.contains(&(date.as_str(), model_id.as_str()))
+                            || recount_proof_cell_is_all_duplicates(entry)
+                    })
+                    .map(|(model_id, entry)| {
+                        (
+                            model_id.clone(),
+                            TsRecountProofEntry {
+                                previous: (&entry.previous).into(),
+                                corrected: (&entry.corrected).into(),
+                            },
+                        )
+                    })
+                    .collect();
+                (!models.is_empty()).then_some((date.clone(), models))
+            })
+            .collect();
+        if !days.is_empty() {
+            proofs.insert(client.clone(), days);
+        }
+    }
+    (!proofs.is_empty()).then_some(proofs)
+}
+
+/// Submission-level provenance (#888): history recovered from an aggregate
+/// export rather than scanned from local session files. The server stamps it
+/// on every client row it writes and flags the profile as including imported
+/// history.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSubmissionProvenance {
+    origin: &'static str,
+    importer: String,
 }
 
 #[derive(serde::Serialize)]
@@ -4862,13 +5479,42 @@ struct TsTokenContributionData {
     time_metrics: Option<TsTimeMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp_servers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<TsSubmissionProvenance>,
 }
 
 fn to_ts_token_contribution_data(
-    graph: &tokscale_core::GraphResult,
+    graph: &tokscale_core::GraphResultV2,
     device: Option<&device::SubmitDevice>,
     scan_scope: Option<TsScanScope>,
 ) -> TsTokenContributionData {
+    let scan_scope = scan_scope.map(|mut scope| {
+        if scope.full_history || !scope.full_history_clients.is_empty() {
+            let mut floors = std::collections::BTreeMap::new();
+            for d in &graph.contributions {
+                for s in &d.clients {
+                    if !scope.full_history
+                        && !scope.full_history_clients.iter().any(|c| c == &s.client)
+                    {
+                        continue;
+                    }
+                    floors
+                        .entry(s.client.clone())
+                        .and_modify(|earliest: &mut String| {
+                            if d.date < *earliest {
+                                *earliest = d.date.clone();
+                            }
+                        })
+                        .or_insert_with(|| d.date.clone());
+                }
+            }
+            if !floors.is_empty() {
+                scope.retention_floors = Some(floors);
+            }
+        }
+        scope.recount_proofs = submission_recount_proofs(graph, &scope);
+        scope
+    });
     TsTokenContributionData {
         meta: TsExportMeta {
             generated_at: graph.meta.generated_at.clone(),
@@ -4892,6 +5538,7 @@ fn to_ts_token_contribution_data(
             max_cost_in_single_day: graph.summary.max_cost_in_single_day,
             clients: graph.summary.clients.clone(),
             models: graph.summary.models.clone(),
+            cost_provenance: graph.summary.cost_provenance,
         },
         years: graph
             .years
@@ -4904,6 +5551,7 @@ fn to_ts_token_contribution_data(
                     start: y.range_start.clone(),
                     end: y.range_end.clone(),
                 },
+                cost_provenance: y.cost_provenance,
             })
             .collect(),
         contributions: graph
@@ -4919,6 +5567,7 @@ fn to_ts_token_contribution_data(
                         .incomplete_cost_dates
                         .contains(&d.date)
                         .then_some(false),
+                    cost_provenance: d.totals.cost_provenance,
                 },
                 intensity: d.intensity,
                 token_breakdown: TsTokenBreakdown {
@@ -4948,6 +5597,7 @@ fn to_ts_token_contribution_data(
                         },
                         cost: s.cost,
                         messages: s.messages,
+                        cost_provenance: s.cost_provenance,
                     })
                     .collect(),
                 active_time_ms: d.active_time_ms,
@@ -4967,27 +5617,93 @@ fn to_ts_token_contribution_data(
                 Some(servers)
             }
         },
+        provenance: None,
     }
+}
+
+/// Atomic source families: the receiver advances them only when every member
+/// arrives in the same snapshot (see MICODE_FAMILY/ANTIGRAVITY_FAMILY in
+/// packages/frontend/src/lib/db/parserHighWater.ts).
+const MICODE_FAMILY: &[&str] = &["micode", "micode-desktop"];
+const ANTIGRAVITY_FAMILY: &[&str] = &["antigravity", "antigravity-cli", "antigravity-extension"];
+
+/// Clients a date-filtered submit still ships complete. The receiver freezes
+/// every versioned parser and atomic source family without full-history
+/// authority, so letting `since`/`until`/`year` scope them would discard
+/// their usage outright instead of narrowing it. Amp additionally needs a
+/// complete thread export before any snapshot of it can claim full coverage.
+/// An atomic-family member is exempted only when the whole family was
+/// selected — otherwise the family plan freezes anyway and the exemption
+/// would bypass the requested date bound without advancing anything.
+fn full_history_exempt_clients<'a>(
+    clients: &'a [String],
+    amp_full_history_safe: bool,
+) -> impl Iterator<Item = String> + 'a {
+    let family_complete = |client: &str| {
+        let family: &[&str] = if MICODE_FAMILY.contains(&client) {
+            MICODE_FAMILY
+        } else if ANTIGRAVITY_FAMILY.contains(&client) {
+            ANTIGRAVITY_FAMILY
+        } else {
+            return true;
+        };
+        family
+            .iter()
+            .all(|member| clients.iter().any(|c| c.as_str() == *member))
+    };
+    clients
+        .iter()
+        .filter(move |client| {
+            tokscale_core::FULL_HISTORY_SUBMIT_CLIENTS.contains(&client.as_str())
+                && (client.as_str() != "amp" || amp_full_history_safe)
+                && family_complete(client.as_str())
+        })
+        .cloned()
 }
 
 /// Parser identity is declared for every scanned client, even for a partial
 /// date range. `full_history` is a separate capability bit: only an unbounded
-/// scan can establish or advance a cumulative rollout high-water.
-fn submit_scan_scope(clients: Option<&[String]>, full_history: bool) -> Option<TsScanScope> {
-    let parser_versions = clients?
+/// scan can establish or advance a cumulative rollout high-water. A partial
+/// scan still names the clients whose messages it ships unfiltered — their
+/// snapshot semantics make a partial window unsubmittable, so the graph
+/// exempts them from the date filter (see `FULL_HISTORY_SUBMIT_CLIENTS`).
+fn submit_scan_scope(
+    clients: Option<&[String]>,
+    full_history: bool,
+    amp_full_history_safe: bool,
+) -> Option<TsScanScope> {
+    let clients = clients?;
+    let parser_versions = clients
         .iter()
         .map(|client| {
-            let version = if client == "copilot" {
-                COPILOT_SUBMISSION_PARSER_VERSION
-            } else {
-                SUBMISSION_PARSER_VERSION
+            let version = match client.as_str() {
+                "amp" => AMP_SUBMISSION_PARSER_VERSION,
+                "copilot" => COPILOT_SUBMISSION_PARSER_VERSION,
+                "cursor" => CURSOR_SUBMISSION_PARSER_VERSION,
+                "devin-cli" => DEVIN_CLI_SUBMISSION_PARSER_VERSION,
+                "micode" | "micode-desktop" => MICODE_SUBMISSION_PARSER_VERSION,
+                _ => SUBMISSION_PARSER_VERSION,
             };
             (client.clone(), version)
         })
         .collect();
+    let full_history_clients: Vec<String> = if full_history {
+        clients
+            .iter()
+            .filter(|client| client.as_str() != "amp" || amp_full_history_safe)
+            .cloned()
+            .collect()
+    } else {
+        full_history_exempt_clients(clients, amp_full_history_safe).collect()
+    };
+    let every_client_complete = full_history_clients.len() == clients.len();
     Some(TsScanScope {
         parser_versions,
-        full_history,
+        // Fail closed for receivers predating `fullHistoryClients`.
+        full_history: full_history && every_client_complete,
+        full_history_clients,
+        retention_floors: None,
+        recount_proofs: None,
     })
 }
 
@@ -4998,8 +5714,9 @@ fn submit_scan_scope(clients: Option<&[String]>, full_history: bool) -> Option<T
 /// reads and parses exactly the same files. Suggesting one would also cost
 /// data — it clears `full_history` on the scan scope, and
 /// `planParserHighWaterSubmission` freezes a partial snapshot for every client
-/// in `SUPPORTED_VERSIONED_PARSERS` (copilot, droid, antigravity-cli,
-/// antigravity). So the tip names `--client` and nothing else.
+/// in `SUPPORTED_VERSIONED_PARSERS` (copilot, droid, Antigravity CLI,
+/// Antigravity IDE Extension, antigravity). So the tip names `--client` and
+/// nothing else.
 ///
 /// It stays quiet once the user has already passed `--client`, and under
 /// autosubmit, whose stdout is the scheduler log file rather than a terminal
@@ -5438,7 +6155,7 @@ fn run_graph_command(
     no_spinner: bool,
 ) -> Result<()> {
     use colored::Colorize;
-    use tokscale_core::{generate_local_graph_report, GroupBy};
+    use tokscale_core::{generate_local_graph_report_v2, GroupBy};
 
     let show_progress = output.is_some() && !no_spinner;
     let mut context = LocalReportContext::new(home_dir, clients, date, None);
@@ -5454,7 +6171,7 @@ fn run_graph_command(
     let rt = tokio::runtime::Runtime::new()?;
     let graph_result = rt
         .block_on(async {
-            generate_local_graph_report(context.report_options(GroupBy::default())).await
+            generate_local_graph_report_v2(context.report_options(GroupBy::default())).await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
     emit_cursor_sync_warning(
@@ -5536,6 +6253,8 @@ fn run_import_command(
     format: String,
     output: Option<String>,
     dry_run: bool,
+    submit: bool,
+    importer: Option<String>,
 ) -> Result<()> {
     use colored::Colorize;
 
@@ -5699,6 +6418,104 @@ fn run_import_command(
         eprintln!("{}", format!("\n  Warning: {}", warning).yellow());
     }
 
+    if submit {
+        let importer = importer.unwrap_or_else(|| fmt.clone()).trim().to_string();
+        if importer.is_empty() || importer.chars().count() > 64 {
+            return Err(anyhow::anyhow!("--importer must be 1-64 characters"));
+        }
+        // The server rejects a whole submission over one unknown client or one
+        // future-dated day, so stop here rather than after an upload that
+        // cannot succeed.
+        if !outcome.unknown_clients.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Not submitting: the leaderboard would reject unrecognized client id(s): {}",
+                outcome.unknown_clients.join(", ")
+            ));
+        }
+        if outcome.future_dated_rows > 0 {
+            return Err(anyhow::anyhow!(
+                "Not submitting: {} row(s) are dated in the future, which the leaderboard rejects",
+                outcome.future_dated_rows
+            ));
+        }
+
+        let mut graph = outcome.graph.clone();
+        // Capture the imported clients before any filtering: the overlap scan
+        // below narrows to the export's clients, and tokenless exclusion may
+        // empty the graph's summary (an all-cost-only export), which would
+        // otherwise leave the scan with no clients to look at.
+        let imported_clients = graph.summary.clients.clone();
+        let excluded_rows = exclude_tokenless_cost_contributions(&mut graph);
+        report_excluded_tokenless_rows(&excluded_rows);
+        // Exclusion can leave a day with no clients at all (e.g. a Cursor
+        // export whose rows that day were all cost-only charges). Remove
+        // emptied days and recompute the rollups so an all-cost-only import
+        // exits below with "Nothing left to submit." instead of POSTing
+        // zero-usage backfill days, and a mixed import carries a correct
+        // dateRange/summary after the emptied days are gone.
+        normalize_graph_after_row_removal(&mut graph);
+        if graph.contributions.is_empty() {
+            eprintln!("{}", "\n  Nothing left to submit.\n".yellow());
+            return Ok(());
+        }
+        let overlap = drop_locally_scanned_usage(&mut graph, &imported_clients)?;
+        if !overlap.is_empty() {
+            const MAX_LISTED: usize = 10;
+            let listed: Vec<String> = overlap
+                .iter()
+                .take(MAX_LISTED)
+                .map(|(date, client)| format!("{date} {client}"))
+                .collect();
+            let more = overlap.len().saturating_sub(MAX_LISTED);
+            eprintln!(
+                "{}",
+                format!(
+                    "\n  Left out {} day/client row(s) this machine's own scan already covers \
+                     (`tokscale submit` reports those), so they are not counted twice: {}{}",
+                    overlap.len(),
+                    listed.join(", "),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                )
+                .yellow()
+            );
+        }
+        // The overlap pass can remove every remaining row. Stop here too, so
+        // an export this machine already reports never becomes an empty
+        // backfill POST.
+        if graph.contributions.is_empty() {
+            eprintln!("{}", "\n  Nothing left to submit.\n".yellow());
+            return Ok(());
+        }
+        eprintln!(
+            "{}",
+            format!(
+                "\n  To submit as imported history ({}): {} days, {} tokens, {}",
+                importer,
+                graph.summary.active_days,
+                format_tokens_with_commas(graph.summary.total_tokens),
+                format_currency(graph.summary.total_cost)
+            )
+            .white()
+        );
+        let payload = backfill_payload(&graph, &importer);
+        if let Some(output_path) = output {
+            std::fs::write(&output_path, serde_json::to_string_pretty(&payload)?)?;
+            eprintln!(
+                "{}",
+                format!("\n  ✓ Payload written to {}", output_path).green()
+            );
+        }
+        if dry_run {
+            eprintln!("{}", "\n  Dry run - not submitting.\n".yellow());
+            return Ok(());
+        }
+        return submit_imported_graph(&payload);
+    }
+
     if dry_run {
         eprintln!(
             "{}",
@@ -5731,13 +6548,149 @@ fn run_import_command(
     eprintln!(
         "{}",
         "\n  Note: import only converts data to tokscale's format; it does not \
-         upload to the leaderboard.\n  Uploading backfilled history needs \
-         server-side support for tagging it distinctly from live CLI usage \
+         upload to the leaderboard.\n  Pass --submit to upload it as imported \
+         history, tagged apart from live CLI usage \
          (see https://github.com/junhoyeo/tokscale/issues/888).\n"
             .bright_black()
     );
 
     Ok(())
+}
+
+/// `import --submit`: upload an imported graph tagged `origin: "backfill"` so
+/// the server can tell it from a local scan (#888). It carries no device, so
+/// it lands on the legacy device row rather than being merged into, or frozen
+/// by, this machine's scanned device; that is why the caller first drops what
+/// this machine's scan covers. No scan scope, so it never establishes or
+/// advances a parser high-water.
+fn submit_imported_graph(payload: &TsTokenContributionData) -> Result<()> {
+    use colored::Colorize;
+
+    let auth_token = auth::resolve_api_token().ok_or_else(|| {
+        anyhow::anyhow!("Not logged in. Run `tokscale login` or set TOKSCALE_API_TOKEN.")
+    })?;
+    eprintln!("{}", "\n  Submitting as imported history...".bright_black());
+    let rt = tokio::runtime::Runtime::new()?;
+    post_submission(&rt, &auth_token, payload, SubmitMode::Interactive)
+}
+
+/// Drop the (date, client) rows of an imported graph that this machine's own
+/// scan also reports, and return them. A device-less backfill is summed with
+/// the scanned device, so an export of history that is still on disk (the
+/// usual `ccusage` case) would otherwise be counted twice. History submitted
+/// earlier whose files are gone can't be seen from here — including the days
+/// the local recovery overlay reconstructs, which submission never sends and
+/// which therefore must not count as coverage.
+fn drop_locally_scanned_usage(
+    graph: &mut tokscale_core::GraphResultV2,
+    imported_clients: &[String],
+) -> Result<Vec<(String, String)>> {
+    use tokscale_core::{generate_source_graph_report_v2, GroupBy, ReportOptions};
+
+    // This scan only feeds overlap detection, which reads (date, client)
+    // identities and non-zero token flags — never costs — so the lenient local
+    // report (optional pricing) is the right generator: a cold pricing cache
+    // must not abort the whole import over a scan whose costs nobody reads.
+    // The imported costs come from the export itself.
+    //
+    // Source-only, not `generate_local_graph_report_v2`: the question here is
+    // "does `tokscale submit` already report this row?", and submission reads
+    // source messages alone. The local recovery overlay is never submitted, so
+    // counting it as coverage would drop an imported row that nothing else ever
+    // uploads (#1364).
+    let rt = tokio::runtime::Runtime::new()?;
+    let local = rt
+        .block_on(generate_source_graph_report_v2(ReportOptions {
+            home_dir: None,
+            use_env_roots: true,
+            clients: Some(imported_clients.to_vec()),
+            since: Some(graph.meta.date_range_start.clone()),
+            until: Some(graph.meta.date_range_end.clone()),
+            year: None,
+            group_by: GroupBy::default(),
+            worktree_rollup: tokscale_core::WorktreeRollup::default(),
+            scanner_settings: tui::settings::load_scanner_settings(),
+        }))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(drop_overlapping_rows(graph, &local))
+}
+
+fn drop_overlapping_rows(
+    graph: &mut tokscale_core::GraphResultV2,
+    local: &tokscale_core::GraphResultV2,
+) -> Vec<(String, String)> {
+    let scanned: std::collections::HashSet<(&str, &str)> = local
+        .contributions
+        .iter()
+        .flat_map(|day| {
+            day.clients
+                .iter()
+                .filter(|c| c.tokens.total() > 0)
+                .map(move |c| (day.date.as_str(), c.client.as_str()))
+        })
+        .collect();
+
+    let mut dropped: Vec<(String, String)> = Vec::new();
+    for day in graph.contributions.iter_mut() {
+        let before = day.clients.len();
+        day.clients.retain(|c| {
+            let overlaps = scanned.contains(&(day.date.as_str(), c.client.as_str()));
+            if overlaps
+                && !dropped
+                    .iter()
+                    .any(|(d, cl)| d == &day.date && cl == &c.client)
+            {
+                dropped.push((day.date.clone(), c.client.clone()));
+            }
+            !overlaps
+        });
+        if day.clients.len() != before {
+            let mut breakdown = tokscale_core::TokenBreakdown::default();
+            for client in &day.clients {
+                breakdown += &client.tokens;
+            }
+            day.totals.tokens = breakdown.total();
+            day.totals.cost = day.clients.iter().map(|c| c.cost).sum();
+            day.totals.messages = day.clients.iter().map(|c| c.messages).sum();
+            day.token_breakdown = breakdown;
+        }
+    }
+
+    if !dropped.is_empty() {
+        normalize_graph_after_row_removal(graph);
+    }
+    dropped
+}
+
+/// Re-normalize a graph after client rows were removed from its days: drop
+/// days left with no clients at all, then rebuild intensities, summary, year
+/// rollups, and the meta date range from what remains. Shared by
+/// [`drop_overlapping_rows`] and the tokenless-cost exclusion path in
+/// `run_import_command`, where exclusion can empty every client of a day.
+fn normalize_graph_after_row_removal(graph: &mut tokscale_core::GraphResultV2) {
+    graph.contributions.retain(|day| !day.clients.is_empty());
+    tokscale_core::calculate_intensities_v2(&mut graph.contributions);
+    graph.summary = tokscale_core::calculate_summary_v2(&graph.contributions);
+    graph.years = tokscale_core::calculate_years_v2(&graph.contributions);
+    if let (Some(first), Some(last)) = (graph.contributions.first(), graph.contributions.last()) {
+        graph.meta.date_range_start = first.date.clone();
+        graph.meta.date_range_end = last.date.clone();
+    }
+}
+
+/// The submit payload for an imported graph. MCP names stay the local ones, as
+/// `submit` sends them: the server stores the latest list per profile, and an
+/// empty one would clear it.
+fn backfill_payload(
+    graph: &tokscale_core::GraphResultV2,
+    importer: &str,
+) -> TsTokenContributionData {
+    let mut payload = to_ts_token_contribution_data(graph, None, None);
+    payload.provenance = Some(TsSubmissionProvenance {
+        origin: "backfill",
+        importer: importer.to_string(),
+    });
+    payload
 }
 
 #[derive(serde::Deserialize)]
@@ -5752,9 +6705,69 @@ struct SubmitResponse {
     details: Option<Vec<String>>,
 }
 
+fn deserialize_optional_i64_from_any<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalI64Visitor;
+    impl<'de> serde::de::Visitor<'de> for OptionalI64Visitor {
+        type Value = Option<i64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer, a string representing an integer, or null")
+        }
+
+        fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            i64::try_from(v).map(Some).map_err(E::custom)
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+            if v.is_finite()
+                && v.fract() == 0.0
+                && v >= i64::MIN as f64
+                && v < 9223372036854775808.0
+            {
+                Ok(Some(v as i64))
+            } else {
+                Err(E::custom(format!("invalid integer value: {v}")))
+            }
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            v.parse::<i64>().map(Some).map_err(E::custom)
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    deserializer.deserialize_option(OptionalI64Visitor)
+}
+
 #[derive(serde::Deserialize)]
 struct SubmitMetrics {
-    #[serde(rename = "totalTokens")]
+    #[serde(
+        rename = "totalTokens",
+        default,
+        deserialize_with = "deserialize_optional_i64_from_any"
+    )]
     total_tokens: Option<i64>,
     #[serde(rename = "totalCost")]
     total_cost: Option<f64>,
@@ -5787,13 +6800,13 @@ fn client_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
 /// drop them either — otherwise that legitimate cost silently disappears from
 /// the submission. Keep in sync with `CURSOR_LEGACY_TOKENLESS_MODELS` in
 /// packages/frontend/src/lib/validation/submission.ts.
-fn is_legacy_tokenless_cursor_row(client: &tokscale_core::ClientContribution) -> bool {
+fn is_legacy_tokenless_cursor_row(client: &tokscale_core::ClientContributionV2) -> bool {
     client.client == "cursor"
         && client.model_id == "premium-tool-call"
         && client_token_total(&client.tokens) == 0
 }
 
-fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContribution) -> bool {
+fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContributionV2) -> bool {
     client.client == "warp"
         && client.model_id == "aggregate-requests"
         && client_token_total(&client.tokens) == 0
@@ -5802,7 +6815,7 @@ fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContribution) -> boo
 /// A row the server's "Cost submitted without tokens" sanity check would
 /// reject: real cost with every token bucket at zero, excluding the Cursor
 /// `premium-tool-call` carve-out above.
-fn is_tokenless_costed_row(client: &tokscale_core::ClientContribution) -> bool {
+fn is_tokenless_costed_row(client: &tokscale_core::ClientContributionV2) -> bool {
     (is_aggregate_only_warp_row(client) || client.cost > 0.0)
         && client_token_total(&client.tokens) == 0
         && !is_legacy_tokenless_cursor_row(client)
@@ -5822,7 +6835,7 @@ fn is_tokenless_costed_row(client: &tokscale_core::ClientContribution) -> bool {
 /// totals, breakdowns, and intensities are untouched. Summary and year rollups
 /// are recomputed from the trimmed contributions.
 fn exclude_tokenless_cost_contributions(
-    graph_result: &mut tokscale_core::GraphResult,
+    graph_result: &mut tokscale_core::GraphResultV2,
 ) -> Vec<ExcludedTokenlessRow> {
     let mut excluded: Vec<ExcludedTokenlessRow> = Vec::new();
 
@@ -5851,12 +6864,24 @@ fn exclude_tokenless_cost_contributions(
         if removed_cost > 0.0 || removed_messages > 0 {
             day.totals.cost = (day.totals.cost - removed_cost).max(0.0);
             day.totals.messages = day.totals.messages.saturating_sub(removed_messages).max(0);
+
+            // The day's provenance folded in the rows just dropped, so rebuild
+            // it from the clients that remain.
+            let mut provenance = tokscale_core::CostProvenanceAccumulator::default();
+            for client in &day.clients {
+                provenance.add_usage(
+                    client.tokens.total(),
+                    client.cost,
+                    &client.cost_provenance(),
+                );
+            }
+            day.totals.cost_provenance = Some(provenance.finish());
         }
     }
 
     if !excluded.is_empty() {
-        graph_result.summary = tokscale_core::calculate_summary(&graph_result.contributions);
-        graph_result.years = tokscale_core::calculate_years(&graph_result.contributions);
+        graph_result.summary = tokscale_core::calculate_summary_v2(&graph_result.contributions);
+        graph_result.years = tokscale_core::calculate_years_v2(&graph_result.contributions);
     }
 
     excluded
@@ -5918,6 +6943,34 @@ fn report_excluded_tokenless_rows(excluded: &[ExcludedTokenlessRow]) {
     println!();
 }
 
+/// Name the clients whose local session sources this scan could not read in
+/// full, and say what that costs the submission. The payload itself stays
+/// path-free; the paths are only printed here for the person at the prompt.
+fn report_incompletely_read_sources(
+    source_reads: &std::collections::BTreeMap<String, tokscale_core::SourceReadSummary>,
+) {
+    use colored::Colorize;
+
+    for (client, summary) in source_reads {
+        if summary.complete() {
+            continue;
+        }
+        let label = tokscale_core::ClientId::from_str(client)
+            .map(|id| id.display_name().to_string())
+            .unwrap_or_else(|| client.clone());
+        println!(
+            "{}",
+            format!(
+                "  {label}: {} of {} session database{} could not be read; its usage is submitted without full-history authority, so stored history is kept as is.",
+                summary.unreadable,
+                summary.discovered,
+                if summary.discovered == 1 { "" } else { "s" },
+            )
+            .yellow()
+        );
+    }
+}
+
 fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissionUsage]) {
     use colored::Colorize;
 
@@ -5929,7 +6982,7 @@ fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissio
     // (dozens in practice), burying the submittable summary. Cap the per-row
     // detail exactly like `report_excluded_tokenless_rows` and report the
     // aggregate instead. This print is the only place the rows surface at all:
-    // `GraphResult::unpriced_submission_usage` is `#[serde(skip)]` and never
+    // `GraphResultV2::unpriced_submission_usage` is `#[serde(skip)]` and never
     // reaches a payload, and `--dry-run` runs this same reporter — so the
     // capped rows are still named by id below rather than dropped.
     const MAX_DETAIL_ROWS: usize = 20;
@@ -6011,7 +7064,7 @@ fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissio
     println!(
         "{}",
         format!(
-            "  Hint: unpriced usage is included in token totals with zero cost. Add exact-match entries to\n          {}\n          keyed by the model id alone (the `model` half of the `provider/model` above),\n          where an explicit 0 declares a free model or a known routing-label rate. Re-check\n          with `tokscale submit --dry-run` and `tokscale pricing <model-id>`, then resubmit\n          to replace the temporary cost floor with a complete total.",
+            "  Hint: unpriced usage is included in token totals with zero cost. Add exact-match entries to\n          {}\n          using global `models` or scoped `provider_overrides`; explicit 0 declares a free rate.\n          Run `tokscale pricing explain --json --no-spinner` to copy the log billing channel\n          and raw model, then query `pricing <model-id> --billing-provider <id> --source custom`.\n          Re-check with `tokscale submit --dry-run`, then resubmit\n          to replace the temporary cost floor with a complete total.",
             pricing_path.display(),
         )
         .bright_black()
@@ -6055,7 +7108,15 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
             };
 
             let (clients, since, until, year) = commands::autosubmit::submit_filters(&settings);
-            match run_submit_command(clients, since, until, year, false, SubmitMode::Autosubmit) {
+            match run_submit_command(
+                clients,
+                since,
+                until,
+                year,
+                false,
+                SubmitMode::Autosubmit,
+                None,
+            ) {
                 Ok(()) => {
                     commands::autosubmit::record_run_success(
                         chrono::Utc::now().timestamp_millis(),
@@ -6079,11 +7140,12 @@ fn run_submit_command(
     year: Option<String>,
     dry_run: bool,
     mode: SubmitMode,
+    cursor_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
     use colored::Colorize;
     use std::io::IsTerminal;
     use tokio::runtime::Runtime;
-    use tokscale_core::{generate_submission_graph, GroupBy, ReportOptions};
+    use tokscale_core::{generate_submission_graph_v2, GroupBy, ReportOptions};
 
     let auth_token = match auth::resolve_api_token() {
         Some(token) => token,
@@ -6120,17 +7182,17 @@ fn run_submit_command(
     let full_history_scan = since.is_none() && until.is_none() && year.is_none();
     let explicit_client_filter = clients.is_some();
     let clients = clients.or_else(|| Some(default_submit_clients()));
-    let scan_scope = submit_scan_scope(clients.as_deref(), full_history_scan);
 
     let include_cursor = clients
         .as_ref()
         .is_none_or(|s| s.iter().any(|src| src == "cursor"));
     let report_home: Option<String> = None;
     let has_cursor_cache = has_cursor_usage_cache_for_report(&report_home);
-    if include_cursor && cursor::is_cursor_logged_in() {
+    if include_cursor && cursor::ensure_cursor_session_for_sync() {
         println!("{}", "  Syncing Cursor usage data...".bright_black());
         let rt_sync = Runtime::new()?;
-        let sync_result = rt_sync.block_on(async { cursor::sync_cursor_cache(false).await });
+        let sync_result =
+            rt_sync.block_on(async { cursor::sync_cursor_cache_for_submit(cursor_timeout).await });
         if sync_result.synced {
             println!(
                 "{}",
@@ -6145,6 +7207,97 @@ fn run_submit_command(
             }
         }
     }
+
+    let include_antigravity = clients
+        .as_ref()
+        .is_none_or(|s| s.iter().any(|src| src == "antigravity"));
+    let has_antigravity_cache = antigravity::has_antigravity_cache();
+    if include_antigravity {
+        match antigravity::detect_antigravity_connections() {
+            Ok(active_connections) if !active_connections.is_empty() => {
+                println!("{}", "  Syncing Antigravity usage data...".bright_black());
+                let sync_result = antigravity::sync_antigravity_cache_with_connections(
+                    &active_connections,
+                    false,
+                );
+                if sync_result.synced {
+                    println!(
+                        "{}",
+                        format!(
+                            "  Antigravity: {} session{} synced from {} active connection{}",
+                            sync_result.sessions,
+                            if sync_result.sessions == 1 { "" } else { "s" },
+                            sync_result.connections,
+                            if sync_result.connections == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        )
+                        .bright_black()
+                    );
+                } else if sync_result.partial {
+                    println!(
+                        "{}",
+                        format!(
+                            "  Antigravity sync was partial: {} session{} refreshed, {} retained from cache, {} failed: {}",
+                            sync_result.sessions,
+                            if sync_result.sessions == 1 { "" } else { "s" },
+                            sync_result.retained_sessions,
+                            sync_result.failed_sessions,
+                            sync_result.error.as_deref().unwrap_or("unknown sync error")
+                        )
+                        .yellow()
+                    );
+                } else if let Some(err) = sync_result.error {
+                    if has_antigravity_cache {
+                        println!(
+                            "{}",
+                            format!("  Antigravity sync failed; using cached data: {}", err)
+                                .yellow()
+                        );
+                    } else {
+                        println!("{}", format!("  Antigravity sync failed: {}", err).yellow());
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                if has_antigravity_cache {
+                    println!(
+                        "{}",
+                        format!("  Antigravity discovery failed; using cached data: {}", err)
+                            .yellow()
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        format!("  Antigravity discovery failed: {}", err).yellow()
+                    );
+                }
+            }
+        }
+    }
+    let amp_sync = auto_sync_amp_for_local_report(&report_home, &clients);
+    emit_amp_sync_warning(
+        amp_sync
+            .as_ref()
+            .and_then(|result| result.warning.as_deref()),
+    );
+    let amp_full_history_safe = amp_sync
+        .as_ref()
+        .is_none_or(amp::AutoSyncAmpResult::allows_full_history);
+    let scan_scope =
+        submit_scan_scope(clients.as_deref(), full_history_scan, amp_full_history_safe);
+    // The receivers freeze these clients without complete coverage, so a
+    // date-bounded submit ships their whole snapshot rather than dropping it.
+    // The same list the scan scope serializes as `fullHistoryClients` is
+    // handed to the graph, so what the payload declares and what it ships
+    // cannot diverge.
+    let full_history_clients: std::collections::BTreeSet<String> = scan_scope
+        .as_ref()
+        .map(|scope| scope.full_history_clients.iter().cloned().collect())
+        .unwrap_or_default();
     if explicit_cursor_filter || explicit_warp_filter || explicit_hindsight_filter {
         let cursor_setup_warnings = setup_warnings_for_report(&report_home, &clients);
         emit_cursor_setup_warnings(&cursor_setup_warnings);
@@ -6200,17 +7353,20 @@ fn run_submit_command(
     let rt = Runtime::new()?;
     let mut graph_result = rt
         .block_on(async {
-            generate_submission_graph(ReportOptions {
-                home_dir: None,
-                use_env_roots: true,
-                clients,
-                since,
-                until,
-                year,
-                group_by: GroupBy::default(),
-                worktree_rollup: tokscale_core::WorktreeRollup::default(),
-                scanner_settings: tui::settings::load_scanner_settings(),
-            })
+            generate_submission_graph_v2(
+                ReportOptions {
+                    home_dir: None,
+                    use_env_roots: true,
+                    clients,
+                    since,
+                    until,
+                    year,
+                    group_by: GroupBy::default(),
+                    worktree_rollup: tokscale_core::WorktreeRollup::default(),
+                    scanner_settings: tui::settings::load_scanner_settings(),
+                },
+                &full_history_clients,
+            )
             .await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -6234,6 +7390,16 @@ fn run_submit_command(
     let excluded_rows = exclude_tokenless_cost_contributions(&mut graph_result);
     report_excluded_tokenless_rows(&excluded_rows);
     report_unpriced_submission_usage(&graph_result.unpriced_submission_usage);
+    // A declared parser generation is identity, not proof that every local
+    // source was read. Withhold full-history authority from any client whose
+    // discovered sources partly failed to open, so the receiver keeps its
+    // stored rows instead of treating a half-read history as the whole.
+    let incomplete_source_clients = incompletely_read_clients(&graph_result.source_reads);
+    report_incompletely_read_sources(&graph_result.source_reads);
+    let scan_scope = scan_scope.map(|mut scope| {
+        withhold_full_history_for_clients(&mut scope, &incomplete_source_clients);
+        scope
+    });
 
     println!("{}", "  Data to submit:".white());
     println!(
@@ -6286,18 +7452,39 @@ fn run_submit_command(
 
     println!("{}", "  Submitting to server...".bright_black());
 
-    let api_url = auth::get_api_base_url();
-
     let submit_device = device::resolve_submit_device()?;
     let submit_payload =
         to_ts_token_contribution_data(&graph_result, Some(&submit_device), scan_scope);
+    post_submission(&rt, &auth_token, &submit_payload, mode)?;
+
+    // Warm the TUI cache so the next `tokscale` launch is instant.
+    // Detached subprocess so submit returns to the shell immediately on large
+    // datasets — a full re-scan would otherwise block for tens of seconds.
+    if mode == SubmitMode::Interactive {
+        spawn_warm_tui_cache_detached();
+    }
+
+    Ok(())
+}
+
+/// POST a prepared payload to `/api/submit` and report the outcome. Shared by
+/// `submit` (a local scan) and `import --submit` (an aggregate export).
+fn post_submission(
+    rt: &tokio::runtime::Runtime,
+    auth_token: &auth::ApiTokenAuth,
+    submit_payload: &TsTokenContributionData,
+    mode: SubmitMode,
+) -> Result<()> {
+    use colored::Colorize;
+
+    let api_url = auth::get_api_base_url();
 
     let response = rt.block_on(async {
         tokscale_core::http::client()
             .post(format!("{}/api/submit", api_url))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", auth_token.token))
-            .json(&submit_payload)
+            .json(submit_payload)
             .send()
             .await
     });
@@ -6410,13 +7597,6 @@ fn run_submit_command(
         }
     }
 
-    // Warm the TUI cache so the next `tokscale` launch is instant.
-    // Detached subprocess so submit returns to the shell immediately on large
-    // datasets — a full re-scan would otherwise block for tens of seconds.
-    if mode == SubmitMode::Interactive {
-        spawn_warm_tui_cache_detached();
-    }
-
     Ok(())
 }
 
@@ -6508,6 +7688,13 @@ fn resolve_light_cache_filter_set(
     }
 }
 
+fn light_cache_group_by(_report_group_by: &tokscale_core::GroupBy) -> tokscale_core::GroupBy {
+    // The light report may use a caller-selected grouping, but this file is the
+    // startup cache for the TUI, whose initial grouping key is always `model`.
+    // Writing the report grouping makes the next TUI launch miss its cache.
+    crate::tui::TUI_DEFAULT_GROUP_BY
+}
+
 fn write_light_cache(
     home_dir: &Option<String>,
     clients: &Option<Vec<String>>,
@@ -6543,8 +7730,9 @@ fn write_light_cache(
     // pattern in `run_warm_tui_cache` below.
     let loader = DataLoader::with_filters(None, since.clone(), until.clone(), year.clone());
     let report_scope = CacheReportScope::new(since.clone(), until.clone(), year.clone());
-    if let Ok(data) = loader.load(&scan_clients, group_by, include_synthetic) {
-        save_cached_data(&data, &enabled_set, group_by, &report_scope);
+    let cache_group_by = light_cache_group_by(group_by);
+    if let Ok(data) = loader.load(&scan_clients, &cache_group_by, include_synthetic) {
+        save_cached_data(&data, &enabled_set, &cache_group_by, &report_scope);
     }
 }
 
@@ -6595,7 +7783,7 @@ fn run_cursor_command(subcommand: CursorSubcommand) -> Result<()> {
         } => cursor::run_cursor_logout(name, all, purge_cache),
         CursorSubcommand::Status { name } => cursor::run_cursor_status(name),
         CursorSubcommand::Accounts { json } => cursor::run_cursor_accounts(json),
-        CursorSubcommand::Sync { json } => cursor::run_cursor_sync(json),
+        CursorSubcommand::Sync { json, timeout } => cursor::run_cursor_sync(json, timeout),
         CursorSubcommand::Switch { name } => cursor::run_cursor_switch(&name),
     }
 }
@@ -7094,9 +8282,29 @@ mod tests {
     use clap::Parser;
     use reqwest::StatusCode;
     use tokscale_core::{
-        calculate_summary, calculate_years, ClientContribution, DailyContribution, DailyTotals,
-        GraphMeta, GraphResult, TokenBreakdown,
+        calculate_summary_v2, calculate_years_v2, ClientContributionV2, DailyContributionV2,
+        DailyTotalsV2, GraphMeta, GraphResultV2, TokenBreakdown,
     };
+
+    #[test]
+    fn model_token_breakdown_json_preserves_all_buckets_in_camel_case() {
+        let tokens = TokenBreakdown {
+            input: 11,
+            output: 22,
+            cache_read: 33,
+            cache_write: 44,
+            cache_write_1h: 15,
+            reasoning: 66,
+        };
+        let json = serde_json::to_value(ModelTokenBreakdownJson::from(tokens)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "input":11, "output":22, "cacheRead":33, "cacheWrite":44,
+                "cacheWrite1h":15, "reasoning":66,
+            })
+        );
+    }
 
     /// The overwhelming majority of the pricing sheet is at or above a cent
     /// per 1M tokens, and that output must not move.
@@ -7162,6 +8370,24 @@ mod tests {
                 "{cost_per_token:e} per token rendered as ${rendered}"
             );
         }
+    }
+
+    /// A report row priced below half a cent per 1M rounded to `$0.00/M` under
+    /// `{:.2}`, which read as free. Negative cost is the missing-value marker
+    /// rather than a bound: a refund is not a cheap rate.
+    #[test]
+    fn format_cost_per_million_renders_sub_cent_and_zero_cleanly() {
+        assert_eq!(format_cost_per_million(0.0, 0), "—");
+        assert_eq!(format_cost_per_million(-1.0, 100), "—");
+        assert_eq!(format_cost_per_million(f64::NAN, 100), "—");
+        assert_eq!(format_cost_per_million(f64::INFINITY, 100), "—");
+        assert_eq!(format_cost_per_million(0.0, 1000), "$0.00/M");
+        assert_eq!(format_cost_per_million(0.000004, 1000), "<$0.01/M");
+        assert_eq!(format_cost_per_million(0.003625, 1_000_000), "<$0.01/M");
+        assert_eq!(format_cost_per_million(0.005, 1_000_000), "<$0.01/M");
+        assert_eq!(format_cost_per_million(0.0099, 1_000_000), "<$0.01/M");
+        assert_eq!(format_cost_per_million(0.01, 1_000_000), "$0.01/M");
+        assert_eq!(format_cost_per_million(15.0, 1_000_000), "$15.00/M");
     }
 
     #[test]
@@ -7275,6 +8501,7 @@ mod tests {
             workspace_key: None,
             workspace_label: None,
             session_id: None,
+            machine: None,
             model: "gemini-3-pro".to_string(),
             provider: "antigravity".to_string(),
             input: i64::MAX,
@@ -7299,6 +8526,7 @@ mod tests {
             workspace_key: None,
             workspace_label: None,
             session_id: None,
+            machine: None,
             model: "gemini-3-pro".to_string(),
             provider: "antigravity".to_string(),
             input: i64::MAX,
@@ -7323,6 +8551,7 @@ mod tests {
             output: 0,
             cache_read: i64::MAX,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: 0,
         };
         assert_eq!(client_token_total(&tokens), i64::MAX);
@@ -7334,6 +8563,7 @@ mod tests {
             output: 0,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: 0,
         }
     }
@@ -7344,30 +8574,32 @@ mod tests {
         total_cost: f64,
         client: &str,
         model_id: &str,
-    ) -> DailyContribution {
-        DailyContribution {
+    ) -> DailyContributionV2 {
+        DailyContributionV2 {
             date: date.to_string(),
-            totals: DailyTotals {
+            totals: DailyTotalsV2 {
                 tokens: total_tokens,
                 cost: total_cost,
                 messages: 1,
+                cost_provenance: None,
             },
             intensity: 0,
             token_breakdown: token_breakdown(total_tokens),
-            clients: vec![ClientContribution {
+            clients: vec![ClientContributionV2 {
                 client: client.to_string(),
                 model_id: model_id.to_string(),
                 provider_id: "openai".to_string(),
                 tokens: token_breakdown(total_tokens),
                 cost: total_cost,
                 messages: 1,
+                cost_provenance: None,
             }],
             active_time_ms: None,
         }
     }
 
-    fn graph_result_with_contributions(contributions: Vec<DailyContribution>) -> GraphResult {
-        GraphResult {
+    fn graph_result_with_contributions(contributions: Vec<DailyContributionV2>) -> GraphResultV2 {
+        GraphResultV2 {
             meta: GraphMeta {
                 generated_at: "2026-03-24T00:00:00Z".to_string(),
                 version: "test".to_string(),
@@ -7381,12 +8613,14 @@ mod tests {
                     .unwrap_or_default(),
                 processing_time_ms: 0,
             },
-            summary: calculate_summary(&contributions),
-            years: calculate_years(&contributions),
+            summary: calculate_summary_v2(&contributions),
+            years: calculate_years_v2(&contributions),
             contributions,
             time_metrics: None,
             unpriced_submission_usage: Vec::new(),
             incomplete_cost_dates: std::collections::BTreeSet::new(),
+            recount_proofs: std::collections::BTreeMap::new(),
+            source_reads: std::collections::BTreeMap::new(),
         }
     }
 
@@ -8500,6 +9734,11 @@ mod tests {
     }
 
     #[test]
+    fn test_capitalize_client_muse() {
+        assert_eq!(capitalize_client("muse"), "Muse Code");
+    }
+
+    #[test]
     fn test_capitalize_client_covers_every_registered_client() {
         for client in tokscale_core::ClientId::iter() {
             assert_eq!(capitalize_client(client.as_str()), client.display_name());
@@ -8620,22 +9859,22 @@ mod tests {
     #[test]
     fn test_light_spinner_frame_0() {
         let frame = LightSpinner::frame(0);
-        assert!(frame.contains("■"));
-        assert!(frame.contains("⬝"));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_active));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_inactive));
     }
 
     #[test]
     fn test_light_spinner_frame_1() {
         let frame = LightSpinner::frame(1);
-        assert!(frame.contains("■"));
-        assert!(frame.contains("⬝"));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_active));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_inactive));
     }
 
     #[test]
     fn test_light_spinner_frame_2() {
         let frame = LightSpinner::frame(2);
-        assert!(frame.contains("■"));
-        assert!(frame.contains("⬝"));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_active));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_inactive));
     }
 
     #[test]
@@ -8703,31 +9942,33 @@ mod tests {
         total_tokens: i64,
         cost: f64,
         messages: i32,
-    ) -> ClientContribution {
-        ClientContribution {
+    ) -> ClientContributionV2 {
+        ClientContributionV2 {
             client: client.to_string(),
             model_id: model_id.to_string(),
             provider_id: provider_id.to_string(),
             tokens: token_breakdown(total_tokens),
             cost,
             messages,
+            cost_provenance: None,
         }
     }
 
     fn day_with_clients(
         date: &str,
         token_breakdown_total: i64,
-        clients: Vec<ClientContribution>,
-    ) -> DailyContribution {
+        clients: Vec<ClientContributionV2>,
+    ) -> DailyContributionV2 {
         let tokens: i64 = clients.iter().map(|c| client_token_total(&c.tokens)).sum();
         let cost: f64 = clients.iter().map(|c| c.cost).sum();
         let messages: i32 = clients.iter().map(|c| c.messages).sum();
-        DailyContribution {
+        DailyContributionV2 {
             date: date.to_string(),
-            totals: DailyTotals {
+            totals: DailyTotalsV2 {
                 tokens,
                 cost,
                 messages,
+                cost_provenance: None,
             },
             intensity: 0,
             token_breakdown: token_breakdown(token_breakdown_total),
@@ -8771,6 +10012,32 @@ mod tests {
         assert_eq!(day.totals.messages, 45);
         assert!((graph.summary.total_cost - 2.08).abs() < 1e-9);
         assert_eq!(graph.summary.total_tokens, 100);
+    }
+
+    #[test]
+    fn test_exclude_tokenless_cost_rebuilds_day_provenance_from_retained_rows() {
+        let mut kept =
+            client_contribution("cursor", "claude-3.7-sonnet", "anthropic", 100, 0.03, 1);
+        kept.cost_provenance = Some(tokscale_core::CostProvenance::provider_reported());
+        let mut dropped = client_contribution("cursor", "auto", "cursor", 0, 0.04, 1);
+        dropped.cost_provenance = Some(tokscale_core::CostProvenance::estimated(
+            tokscale_core::EstimateSource::Catalog,
+        ));
+        let empty = client_contribution("cursor", "empty", "cursor", 0, 0.0, 1);
+        let mut day = day_with_clients("2025-05-28", 100, vec![kept, dropped, empty]);
+        day.totals.cost_provenance = Some(tokscale_core::CostProvenance::mixed(None));
+        let mut graph = graph_result_with_contributions(vec![day]);
+
+        exclude_tokenless_cost_contributions(&mut graph);
+
+        assert_eq!(
+            graph.contributions[0].totals.cost_provenance,
+            Some(tokscale_core::CostProvenance::provider_reported())
+        );
+        assert_eq!(
+            graph.summary.cost_provenance(),
+            tokscale_core::CostProvenance::provider_reported()
+        );
     }
 
     #[test]
@@ -8888,10 +10155,269 @@ mod tests {
     }
 
     #[test]
+    fn submit_payload_serializes_cost_provenance_on_all_aggregates() {
+        let mut day1 = daily_contribution("2026-12-30", 100, 1.50, "claude", "claude-sonnet-4-5");
+        day1.totals.cost_provenance = Some(tokscale_core::CostProvenance::provider_reported());
+        day1.clients[0].cost_provenance = Some(tokscale_core::CostProvenance::provider_reported());
+
+        let mut day2 = daily_contribution("2026-12-31", 200, 2.00, "codex", "gpt-5");
+        day2.totals.cost_provenance = Some(tokscale_core::CostProvenance::estimated(
+            tokscale_core::EstimateSource::Catalog,
+        ));
+        day2.clients[0].cost_provenance = Some(tokscale_core::CostProvenance::estimated(
+            tokscale_core::EstimateSource::Catalog,
+        ));
+
+        let mut graph = graph_result_with_contributions(vec![day1, day2]);
+        graph.summary.cost_provenance = Some(tokscale_core::CostProvenance::mixed(None));
+        graph.years[0].cost_provenance = Some(tokscale_core::CostProvenance::mixed(None));
+
+        let payload = to_ts_token_contribution_data(&graph, None, None);
+        let json = serde_json::to_value(&payload).unwrap();
+
+        // summary
+        assert_eq!(
+            json.pointer("/summary/costProvenance"),
+            Some(&serde_json::json!({ "kind": "mixed" }))
+        );
+
+        // years
+        assert_eq!(
+            json.pointer("/years/0/costProvenance"),
+            Some(&serde_json::json!({ "kind": "mixed" }))
+        );
+
+        // contributions[0].totals and clients[0]
+        assert_eq!(
+            json.pointer("/contributions/0/totals/costProvenance"),
+            Some(&serde_json::json!({ "kind": "providerReported" }))
+        );
+        assert_eq!(
+            json.pointer("/contributions/0/clients/0/costProvenance"),
+            Some(&serde_json::json!({ "kind": "providerReported" }))
+        );
+
+        // contributions[1].totals and clients[0]
+        assert_eq!(
+            json.pointer("/contributions/1/totals/costProvenance"),
+            Some(&serde_json::json!({ "kind": "estimated", "estimateSource": "catalog" }))
+        );
+        assert_eq!(
+            json.pointer("/contributions/1/clients/0/costProvenance"),
+            Some(&serde_json::json!({ "kind": "estimated", "estimateSource": "catalog" }))
+        );
+
+        // existing fields preserved
+        assert_eq!(
+            json.pointer("/summary/totalCost"),
+            Some(&serde_json::json!(3.5))
+        );
+        assert_eq!(
+            json.pointer("/contributions/0/totals/cost"),
+            Some(&serde_json::json!(1.5))
+        );
+        assert_eq!(
+            json.pointer("/contributions/0/clients/0/cost"),
+            Some(&serde_json::json!(1.5))
+        );
+    }
+
+    /// Both payload builders call `discover_mcp_server_names(None)`, which falls
+    /// back to `dirs::home_dir()` and reads the developer's own
+    /// `~/.claude/.mcp.json`. That made the `mcpServers` assertion below depend
+    /// on ambient state: on a machine with configured MCP servers the two
+    /// payloads were compared while a *concurrent* test swapped `HOME` between
+    /// the two calls, so the lists disagreed and the test failed — while
+    /// passing alone and under a clean `HOME`.
+    ///
+    /// `serial_test` plus an isolated `HOME` makes the list empty and stable on
+    /// every machine, which is what the assertion actually wants: the two
+    /// payloads agree, whatever the list is.
+    #[test]
+    #[serial_test::serial]
+    fn imported_graph_submits_as_backfill_without_device_or_scope() {
+        let graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-05-01",
+            1_000,
+            1.25,
+            "claude",
+            "claude-opus-4-8",
+        )]);
+
+        struct HomeRestore(Option<std::ffi::OsString>);
+        impl Drop for HomeRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("HOME", value),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+
+        let home = tempfile::TempDir::new().unwrap();
+        let _restore = HomeRestore(std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let json = serde_json::to_value(backfill_payload(&graph, "ccusage")).unwrap();
+        assert_eq!(
+            json.get("provenance"),
+            Some(&serde_json::json!({ "origin": "backfill", "importer": "ccusage" }))
+        );
+        // No device: the server files it on the legacy row, where `origin` in
+        // the ratchet key keeps it additive with scanned history.
+        assert!(json.get("device").is_none());
+        // No scan scope: a backfill never sets or advances a parser high-water.
+        assert!(json.get("scanScope").is_none());
+        assert_eq!(
+            json.pointer("/contributions/0/date"),
+            Some(&serde_json::json!("2026-05-01"))
+        );
+
+        // An ordinary scan payload stays unlabelled, and both carry the same
+        // (local) MCP list, so a backfill doesn't clear the profile's.
+        let scanned =
+            serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        assert!(scanned.get("provenance").is_none());
+        assert_eq!(json.get("mcpServers"), scanned.get("mcpServers"));
+        // The isolated home configures no MCP servers, so the agreed-on value
+        // is absent rather than whatever this machine happens to have. Asserting
+        // it pins the isolation itself: a future `HOME` leak shows up here
+        // instead of as an intermittent inequality above.
+        assert!(
+            json.get("mcpServers").is_none(),
+            "mcpServers leaked from outside the isolated HOME: {:?}",
+            json.get("mcpServers")
+        );
+    }
+
+    #[test]
+    fn import_submit_drops_rows_this_machine_already_scanned() {
+        let mut both = daily_contribution("2026-05-01", 100, 1.0, "claude", "claude-opus-4-8");
+        let codex = daily_contribution("2026-05-01", 40, 0.5, "codex", "gpt-5.5");
+        both.clients.extend(codex.clients);
+        both.totals.tokens = 140;
+        both.totals.cost = 1.5;
+        both.totals.messages = 2;
+        both.token_breakdown = token_breakdown(140);
+        let mut imported = graph_result_with_contributions(vec![
+            both,
+            daily_contribution("2026-05-02", 70, 0.7, "claude", "claude-opus-4-8"),
+        ]);
+        // This machine's scan still has Claude on 05-01 (a different model even),
+        // and nothing on 05-02.
+        let local = graph_result_with_contributions(vec![daily_contribution(
+            "2026-05-01",
+            90,
+            0.9,
+            "claude",
+            "claude-fable-5",
+        )]);
+
+        let dropped = drop_overlapping_rows(&mut imported, &local);
+        assert_eq!(
+            dropped,
+            vec![("2026-05-01".to_string(), "claude".to_string())]
+        );
+        let may = &imported.contributions[0];
+        assert_eq!(may.clients.len(), 1);
+        assert_eq!(may.clients[0].client, "codex");
+        assert_eq!(may.totals.tokens, 40);
+        assert_eq!(may.token_breakdown.total(), 40);
+        assert!((may.totals.cost - 0.5).abs() < 1e-9);
+        assert_eq!(imported.summary.total_tokens, 110);
+        assert_eq!(imported.contributions[1].totals.tokens, 70);
+
+        // A day left with no clients disappears, and the range follows.
+        let mut only_claude = graph_result_with_contributions(vec![
+            daily_contribution("2026-05-01", 100, 1.0, "claude", "claude-opus-4-8"),
+            daily_contribution("2026-05-02", 70, 0.7, "claude", "claude-opus-4-8"),
+        ]);
+        drop_overlapping_rows(&mut only_claude, &local);
+        assert_eq!(only_claude.contributions.len(), 1);
+        assert_eq!(only_claude.meta.date_range_start, "2026-05-02");
+        assert_eq!(only_claude.summary.total_tokens, 70);
+    }
+
+    /// F1: tokenless-cost exclusion can empty every client of a day. The
+    /// import submit path must drop that day and recompute the graph (what
+    /// `drop_overlapping_rows` already does after overlap drops), so a mixed
+    /// import never uploads zero-usage backfill days with a stale date range.
+    #[test]
+    fn import_submit_drops_days_tokenless_exclusion_emptied() {
+        let mut imported = graph_result_with_contributions(vec![
+            // 05-01: real usage plus a cost-only Cursor charge.
+            day_with_clients(
+                "2026-05-01",
+                100,
+                vec![
+                    client_contribution("cursor", "claude-3.7-sonnet", "anthropic", 100, 0.03, 1),
+                    client_contribution("cursor", "auto", "cursor", 0, 0.04, 1),
+                ],
+            ),
+            // 05-02: only cost-only charges — exclusion empties the whole day.
+            day_with_clients(
+                "2026-05-02",
+                0,
+                vec![client_contribution("cursor", "auto", "cursor", 0, 0.04, 1)],
+            ),
+        ]);
+
+        let excluded = exclude_tokenless_cost_contributions(&mut imported);
+        assert_eq!(excluded.len(), 2);
+        // Exclusion alone leaves the emptied day in place.
+        assert_eq!(imported.contributions.len(), 2);
+        assert!(imported.contributions[1].clients.is_empty());
+
+        normalize_graph_after_row_removal(&mut imported);
+
+        assert_eq!(imported.contributions.len(), 1);
+        assert_eq!(imported.contributions[0].date, "2026-05-01");
+        assert_eq!(imported.meta.date_range_start, "2026-05-01");
+        assert_eq!(imported.meta.date_range_end, "2026-05-01");
+        assert_eq!(imported.summary.total_tokens, 100);
+        assert!((imported.summary.total_cost - 0.03).abs() < 1e-9);
+        assert_eq!(imported.summary.active_days, 1);
+        assert_eq!(imported.years.len(), 1);
+        assert_eq!(imported.years[0].range_start, "2026-05-01");
+        assert_eq!(imported.years[0].range_end, "2026-05-01");
+    }
+
+    /// F1: an export whose rows are ALL cost-only (no tokens anywhere) must
+    /// normalize to zero contributions, which is exactly what
+    /// `run_import_command`'s "Nothing left to submit." early exit keys on —
+    /// no payload is ever built or POSTed for it.
+    #[test]
+    fn import_submit_all_cost_only_normalizes_to_nothing_to_submit() {
+        let mut imported = graph_result_with_contributions(vec![
+            day_with_clients(
+                "2026-05-01",
+                0,
+                vec![client_contribution("cursor", "auto", "cursor", 0, 0.04, 1)],
+            ),
+            day_with_clients(
+                "2026-05-02",
+                0,
+                vec![client_contribution("cursor", "auto", "cursor", 0, 0.04, 1)],
+            ),
+        ]);
+
+        let excluded = exclude_tokenless_cost_contributions(&mut imported);
+        assert_eq!(excluded.len(), 2);
+
+        normalize_graph_after_row_removal(&mut imported);
+
+        assert!(imported.contributions.is_empty());
+        assert_eq!(imported.summary.total_tokens, 0);
+        assert_eq!(imported.summary.active_days, 0);
+    }
+
+    #[test]
     fn submit_scan_scope_separates_parser_identity_from_full_history() {
         let clients = vec!["codex".to_string(), "copilot".to_string()];
-        let full = submit_scan_scope(Some(&clients), true).expect("full scope");
-        let partial = submit_scan_scope(Some(&clients), false).expect("partial scope");
+        let full = submit_scan_scope(Some(&clients), true, true).expect("full scope");
+        let partial = submit_scan_scope(Some(&clients), false, true).expect("partial scope");
 
         assert!(full.full_history);
         assert!(!partial.full_history);
@@ -8905,14 +10431,57 @@ mod tests {
     }
 
     #[test]
+    fn submit_scan_scope_gates_amp_full_history_on_cache_completeness() {
+        let clients = vec!["amp".to_string(), "codex".to_string()];
+        let incomplete = submit_scan_scope(Some(&clients), true, false).expect("scope");
+        let complete = submit_scan_scope(Some(&clients), true, true).expect("scope");
+
+        assert_eq!(
+            incomplete.parser_versions.get("amp"),
+            Some(&AMP_SUBMISSION_PARSER_VERSION)
+        );
+        assert!(!incomplete.full_history);
+        assert!(!incomplete.full_history_clients.contains(&"amp".to_string()));
+        assert!(incomplete
+            .full_history_clients
+            .contains(&"codex".to_string()));
+        assert!(complete.full_history);
+        assert!(complete.full_history_clients.contains(&"amp".to_string()));
+    }
+
+    #[test]
     fn submit_scan_scope_keeps_a_partial_client_filter_narrow() {
         let clients = vec!["codex".to_string()];
-        let scope = submit_scan_scope(Some(&clients), true).expect("codex scope");
+        let scope = submit_scan_scope(Some(&clients), true, true).expect("codex scope");
 
         assert_eq!(
             scope.parser_versions,
             std::collections::BTreeMap::from([("codex".to_string(), SUBMISSION_PARSER_VERSION)])
         );
+    }
+
+    #[test]
+    fn submit_scan_scope_declares_micode_family_without_expanding_selection() {
+        let clients = vec!["micode".to_string(), "micode-desktop".to_string()];
+        for full_history in [true, false] {
+            let scope = submit_scan_scope(Some(&clients), full_history, true).unwrap();
+            let json = serde_json::to_value(&scope).unwrap();
+            assert_eq!(json["parserVersions"]["micode"], 2);
+            assert_eq!(json["parserVersions"]["micode-desktop"], 2);
+            assert_eq!(json["fullHistory"], full_history);
+            assert_eq!(scope.parser_versions.len(), 2);
+        }
+
+        for selected in ["micode", "micode-desktop"] {
+            let scope = submit_scan_scope(Some(&[selected.to_string()]), true, true).unwrap();
+            assert_eq!(
+                scope.parser_versions,
+                std::collections::BTreeMap::from([(
+                    selected.to_string(),
+                    MICODE_SUBMISSION_PARSER_VERSION,
+                )])
+            );
+        }
     }
 
     /// Droid is bounded by the server's device/client lifetime high-water
@@ -8925,9 +10494,409 @@ mod tests {
     #[test]
     fn submit_scan_scope_declares_the_droid_generation_the_server_registers() {
         let clients = vec!["droid".to_string()];
-        let scope = submit_scan_scope(Some(&clients), true).expect("droid scope");
+        let scope = submit_scan_scope(Some(&clients), true, true).expect("droid scope");
 
         assert_eq!(scope.parser_versions.get("droid"), Some(&1));
+    }
+
+    /// A date-bounded submit still ships the snapshot-integrity clients
+    /// complete: `SUPPORTED_VERSIONED_PARSERS` and the atomic source families
+    /// freeze on a partial snapshot, so scoping them by date would discard
+    /// the window's usage instead of narrowing it. Bounded-growth clients
+    /// stay filtered.
+    #[test]
+    fn submit_scan_scope_names_snapshot_clients_complete_on_a_partial_scan() {
+        let clients = vec![
+            "codex".to_string(),
+            "copilot".to_string(),
+            "droid".to_string(),
+        ];
+        let scope = submit_scan_scope(Some(&clients), false, true).expect("partial scope");
+
+        assert!(!scope.full_history);
+        assert_eq!(
+            scope.full_history_clients,
+            vec!["copilot".to_string(), "droid".to_string()]
+        );
+        assert!(!scope.full_history_clients.contains(&"codex".to_string()));
+    }
+
+    /// Amp only carries full-history authority when its thread export was
+    /// complete; the same gate applies on a partial scan as on a full one.
+    #[test]
+    fn submit_scan_scope_partial_scan_still_gates_amp_on_cache_completeness() {
+        let clients = vec!["amp".to_string(), "droid".to_string()];
+        let incomplete = submit_scan_scope(Some(&clients), false, false).expect("scope");
+        let complete = submit_scan_scope(Some(&clients), false, true).expect("scope");
+
+        assert!(!incomplete.full_history_clients.contains(&"amp".to_string()));
+        assert!(incomplete
+            .full_history_clients
+            .contains(&"droid".to_string()));
+        assert!(complete.full_history_clients.contains(&"amp".to_string()));
+    }
+
+    /// Selecting one member of an atomic family on a bounded scan cannot
+    /// satisfy the receiver's all-members completeness contract, so it must
+    /// not be exempted — its messages stay inside the requested date window.
+    /// With every member selected, the family ships complete as a unit.
+    #[test]
+    fn submit_scan_scope_partial_scan_skips_incomplete_atomic_families() {
+        let solo = submit_scan_scope(Some(&["micode".to_string()]), false, true).expect("scope");
+        assert!(solo.full_history_clients.is_empty());
+
+        let solo_ag = submit_scan_scope(
+            Some(&["antigravity-cli".to_string(), "codex".to_string()]),
+            false,
+            true,
+        )
+        .expect("scope");
+        assert!(solo_ag.full_history_clients.is_empty());
+
+        let family = vec!["micode".to_string(), "micode-desktop".to_string()];
+        let together = submit_scan_scope(Some(&family), false, true).expect("scope");
+        assert_eq!(together.full_history_clients, family);
+    }
+
+    /// The exemption list mirrors the receiver's snapshot-integrity set. A
+    /// bounded submit that filtered a recounting client would freeze on the
+    /// receiver and discard the window's usage, and its proof only rides on a
+    /// declared-complete snapshot.
+    #[test]
+    fn submit_scan_scope_names_recount_clients_complete_on_a_partial_scan() {
+        let clients = vec![
+            "codex".to_string(),
+            "cursor".to_string(),
+            "devin-cli".to_string(),
+        ];
+        let scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
+
+        assert!(!scope.full_history);
+        assert_eq!(
+            scope.full_history_clients,
+            vec!["cursor".to_string(), "devin-cli".to_string()]
+        );
+        assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
+        assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
+    }
+
+    /// The blocker class from #1414 applies to the bounded path too: a client
+    /// the scan could only partially read must never be declared complete,
+    /// even though the date-filter exemption already shipped what it could
+    /// read. Withholding the declaration keeps the receiver's stored rows —
+    /// an undeclared versioned parser freezes instead of replacing history.
+    #[test]
+    fn bounded_scan_withholds_declaration_from_partially_read_exempt_clients() {
+        let clients = vec![
+            "codex".to_string(),
+            "cursor".to_string(),
+            "devin-cli".to_string(),
+            "droid".to_string(),
+        ];
+        let mut scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
+        assert_eq!(
+            scope.full_history_clients,
+            vec![
+                "cursor".to_string(),
+                "devin-cli".to_string(),
+                "droid".to_string(),
+            ]
+        );
+
+        let mut reads = std::collections::BTreeMap::new();
+        reads.insert(
+            "cursor".to_string(),
+            tokscale_core::SourceReadSummary {
+                discovered: 2,
+                unreadable: 1,
+            },
+        );
+        withhold_full_history_for_clients(&mut scope, &incompletely_read_clients(&reads));
+
+        assert!(!scope.full_history);
+        assert_eq!(
+            scope.full_history_clients,
+            vec!["devin-cli".to_string(), "droid".to_string()]
+        );
+        // Identity stays declared; only Cursor's completeness authority is gone.
+        assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
+    }
+
+    /// Generation 2 lowers both recounting clients: Devin CLI collapses
+    /// request_id copies and Cursor collapses usageEventId snapshots. The
+    /// receiver registers the same submission generation and freezes generation
+    /// 1 only after a device transitions.
+    #[test]
+    fn submit_scan_scope_declares_the_recount_generations_the_server_registers() {
+        let clients = vec!["cursor".to_string(), "devin-cli".to_string()];
+        let scope = submit_scan_scope(Some(&clients), true, true).expect("recount scope");
+
+        assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
+        assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
+        // The desktop surface parses an unrelated ACP stream and is unaffected
+        // by the CLI request_id dedup; it keeps the default generation.
+        let desktop = vec!["devin-desktop".to_string()];
+        let scope = submit_scan_scope(Some(&desktop), true, true).expect("devin-desktop scope");
+        assert_eq!(scope.parser_versions.get("devin-desktop"), Some(&1));
+    }
+
+    fn recount_cell(input: i64, cost: f64, messages: i32) -> tokscale_core::RecountProofCell {
+        tokscale_core::RecountProofCell {
+            tokens: tokscale_core::TokenBreakdown {
+                input,
+                ..Default::default()
+            },
+            cost,
+            messages,
+        }
+    }
+
+    /// The proof rides only on full-history authority and only for days the
+    /// payload actually dates for that client: a bounded scan freezes on the
+    /// receiver anyway, and a proof for a day the submission never covers
+    /// could not be checked against the snapshot it claims to describe. The
+    /// one exception is a day whose corrected side is empty, where "nothing
+    /// submitted" IS the snapshot the proof describes.
+    #[test]
+    fn submit_payload_ships_recount_proofs_only_with_full_history_authority() {
+        let mut graph = graph_result_with_contributions(vec![day_with_clients(
+            "2026-10-08",
+            350,
+            vec![client_contribution(
+                "devin-cli",
+                "swe-2-high",
+                "devin",
+                350,
+                3.5,
+                7,
+            )],
+        )]);
+        let mut proof = tokscale_core::ClientRecountProof::new();
+        proof.entry("2026-10-08".to_string()).or_default().insert(
+            "swe-2-high".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(400, 4.0, 8),
+                corrected: recount_cell(350, 3.5, 7),
+            },
+        );
+        // Excluded below: a day the contributions no longer carry.
+        proof.entry("2026-10-01".to_string()).or_default().insert(
+            "swe-2-high".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(10, 0.1, 1),
+                corrected: recount_cell(10, 0.1, 1),
+            },
+        );
+        // Kept below: every row of this day was a request_id duplicate of a
+        // row the corrected generation dated elsewhere, so the day has no
+        // contribution and yet its stored over-count still needs the proof.
+        proof.entry("2026-10-02".to_string()).or_default().insert(
+            "swe-2-high".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(25, 0.25, 2),
+                corrected: recount_cell(0, 0.0, 0),
+            },
+        );
+        graph.recount_proofs.insert("devin-cli".to_string(), proof);
+        let clients = vec!["devin-cli".to_string()];
+
+        let full = to_ts_token_contribution_data(
+            &graph,
+            None,
+            submit_scan_scope(Some(&clients), true, true),
+        );
+        let json = serde_json::to_value(&full).unwrap();
+        let proofs = &json["scanScope"]["recountProofs"]["devin-cli"];
+        assert_eq!(
+            proofs["2026-10-08"]["swe-2-high"]["previous"]["tokens"]["input"],
+            400
+        );
+        assert_eq!(
+            proofs["2026-10-08"]["swe-2-high"]["previous"]["messages"],
+            8
+        );
+        assert_eq!(
+            proofs["2026-10-08"]["swe-2-high"]["corrected"]["tokens"]["input"],
+            350
+        );
+        assert_eq!(proofs["2026-10-08"]["swe-2-high"]["corrected"]["cost"], 3.5);
+        assert!(proofs.get("2026-10-01").is_none());
+        assert_eq!(
+            proofs["2026-10-02"]["swe-2-high"]["previous"]["tokens"]["input"],
+            25
+        );
+        assert_eq!(
+            proofs["2026-10-02"]["swe-2-high"]["corrected"]["messages"],
+            0
+        );
+
+        // A date-bounded submit still ships devin-cli complete (it is in
+        // `FULL_HISTORY_SUBMIT_CLIENTS`), so the client keeps per-client
+        // full-history authority and its proof rides along: the payload
+        // dates every day the proof describes.
+        let bounded = to_ts_token_contribution_data(
+            &graph,
+            None,
+            submit_scan_scope(Some(&clients), false, true),
+        );
+        let bounded_scope = bounded.scan_scope.as_ref().expect("bounded scope");
+        assert!(!bounded_scope.full_history);
+        assert_eq!(bounded_scope.full_history_clients, clients);
+        let bounded_proofs = bounded_scope
+            .recount_proofs
+            .as_ref()
+            .expect("bounded submit ships the proof for a declared client");
+        assert!(bounded_proofs.contains_key("devin-cli"));
+
+        // Full-history authority withheld for this client withholds its proof.
+        let mut withheld = submit_scan_scope(Some(&clients), true, true).unwrap();
+        withhold_full_history_for_clients(
+            &mut withheld,
+            &["devin-cli".to_string()].into_iter().collect(),
+        );
+        let payload = to_ts_token_contribution_data(&graph, None, Some(withheld));
+        let scope = payload.scan_scope.as_ref().unwrap();
+        assert!(!scope.full_history);
+        assert!(scope.full_history_clients.is_empty());
+        assert!(scope.recount_proofs.is_none());
+    }
+
+    #[test]
+    fn cursor_payload_ships_only_snapshot_matching_proof_cells_with_authority() {
+        let mut graph = graph_result_with_contributions(vec![day_with_clients(
+            "2026-10-08",
+            350,
+            vec![client_contribution(
+                "cursor",
+                "gemini-4-argon-medium",
+                "cursor",
+                350,
+                3.5,
+                1,
+            )],
+        )]);
+        let mut proof = tokscale_core::ClientRecountProof::new();
+        proof.entry("2026-10-08".to_string()).or_default().insert(
+            "gemini-4-argon-medium".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(900, 9.0, 3),
+                corrected: recount_cell(350, 3.5, 1),
+            },
+        );
+        // Submission strips tokenless cost rows after the core proof is built.
+        // Model-granular filtering must not let this absent cell invalidate the
+        // otherwise matching Cursor proof for the day.
+        proof.entry("2026-10-08".to_string()).or_default().insert(
+            "tokenless-model".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(0, 2.0, 2),
+                corrected: recount_cell(0, 1.0, 1),
+            },
+        );
+        // A genuinely all-duplicate cell has no submitted contribution and is
+        // still required to heal the stored day.
+        proof.entry("2026-10-07".to_string()).or_default().insert(
+            "gemini-4-argon-medium".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(25, 0.25, 1),
+                corrected: recount_cell(0, 0.0, 0),
+            },
+        );
+        graph.recount_proofs.insert("cursor".to_string(), proof);
+        let clients = vec!["cursor".to_string()];
+
+        let full = to_ts_token_contribution_data(
+            &graph,
+            None,
+            submit_scan_scope(Some(&clients), true, true),
+        );
+        let proofs = full
+            .scan_scope
+            .as_ref()
+            .and_then(|scope| scope.recount_proofs.as_ref())
+            .expect("Cursor proof ships with authority");
+        let cursor = &proofs["cursor"];
+        assert_eq!(
+            cursor["2026-10-08"]["gemini-4-argon-medium"]
+                .previous
+                .tokens
+                .input,
+            900
+        );
+        assert!(!cursor["2026-10-08"].contains_key("tokenless-model"));
+        assert_eq!(
+            cursor["2026-10-07"]["gemini-4-argon-medium"]
+                .corrected
+                .messages,
+            0
+        );
+
+        // A bounded CLI request still carries full-history authority for Cursor:
+        // its rows are exempt from the date filter, so the proof is safe.
+        let bounded = to_ts_token_contribution_data(
+            &graph,
+            None,
+            submit_scan_scope(Some(&clients), false, true),
+        );
+        assert!(bounded
+            .scan_scope
+            .as_ref()
+            .and_then(|scope| scope.recount_proofs.as_ref())
+            .is_some_and(|proofs| proofs.contains_key("cursor")));
+
+        let mut withheld = submit_scan_scope(Some(&clients), true, true).unwrap();
+        withhold_full_history_for_clients(
+            &mut withheld,
+            &["cursor".to_string()].into_iter().collect(),
+        );
+        let withheld = to_ts_token_contribution_data(&graph, None, Some(withheld));
+        assert!(withheld
+            .scan_scope
+            .as_ref()
+            .and_then(|scope| scope.recount_proofs.as_ref())
+            .is_none());
+    }
+
+    /// `fullHistory` only ever meant "no date filter". A Devin database that
+    /// fails to open yields an empty row set, indistinguishable from no usage,
+    /// so the scan's source-read summary is what demotes the client: it keeps
+    /// its declared generation but loses the authority to rewrite history.
+    #[test]
+    fn unreadable_sources_withhold_full_history_from_that_client_only() {
+        let mut reads = std::collections::BTreeMap::new();
+        reads.insert(
+            "devin-cli".to_string(),
+            tokscale_core::SourceReadSummary {
+                discovered: 2,
+                unreadable: 1,
+            },
+        );
+        reads.insert(
+            "claude".to_string(),
+            tokscale_core::SourceReadSummary {
+                discovered: 3,
+                unreadable: 0,
+            },
+        );
+        let incomplete = incompletely_read_clients(&reads);
+        assert_eq!(incomplete.len(), 1);
+        assert!(incomplete.contains("devin-cli"));
+
+        let clients = vec!["claude".to_string(), "devin-cli".to_string()];
+        let mut scope = submit_scan_scope(Some(&clients), true, true).unwrap();
+        assert!(scope.full_history);
+        withhold_full_history_for_clients(&mut scope, &incomplete);
+        // Fail closed for receivers predating `fullHistoryClients`, but keep
+        // the complete sibling's authority for receivers that read it.
+        assert!(!scope.full_history);
+        assert_eq!(scope.full_history_clients, vec!["claude".to_string()]);
+        assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
+
+        // Nothing unreadable leaves the scope untouched.
+        let mut intact = submit_scan_scope(Some(&clients), true, true).unwrap();
+        withhold_full_history_for_clients(&mut intact, &std::collections::BTreeSet::new());
+        assert!(intact.full_history);
+        assert_eq!(intact.full_history_clients.len(), 2);
     }
 
     /// The tip is advice for a person at a prompt. Autosubmit's stdout is the
@@ -9129,6 +11098,29 @@ mod tests {
     fn clap_accepts_cursor_sync_command() {
         assert!(Cli::try_parse_from(["tokscale", "cursor", "sync"]).is_ok());
         assert!(Cli::try_parse_from(["tokscale", "cursor", "sync", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "cursor", "sync", "--timeout", "300"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "cursor", "sync", "--timeout", "0"]).is_err());
+        assert!(Cli::try_parse_from(["tokscale", "cursor", "sync", "--timeout", "86400"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "cursor", "sync", "--timeout", "86401"]).is_err());
+        // A 19-digit value used to parse and then panic on `Instant` overflow.
+        assert!(Cli::try_parse_from([
+            "tokscale",
+            "cursor",
+            "sync",
+            "--timeout",
+            "18446744073709551615"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn clap_accepts_submit_timeout_options() {
+        assert!(Cli::try_parse_from(["tokscale", "submit"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--timeout", "300"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--cursor-timeout", "300"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--timeout", "0"]).is_err());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--timeout", "86400"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--timeout", "86401"]).is_err());
     }
 
     #[test]
@@ -9285,6 +11277,86 @@ mod tests {
     }
 
     #[test]
+    fn light_cache_uses_the_tui_grouping_key() {
+        assert_eq!(
+            light_cache_group_by(&tokscale_core::GroupBy::default()),
+            tui::TUI_DEFAULT_GROUP_BY
+        );
+        assert_eq!(
+            light_cache_group_by(&tokscale_core::GroupBy::WorkspaceModel),
+            tui::TUI_DEFAULT_GROUP_BY
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn light_cache_writer_round_trips_through_the_tui_key() {
+        struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (key, previous) in self.0.drain(..).rev() {
+                    unsafe {
+                        match previous {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+
+        let home = tempfile::TempDir::new().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let values = vec![
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("TOKSCALE_CONFIG_DIR", config.path().as_os_str().to_owned()),
+            (
+                "CLAUDE_CONFIG_DIR",
+                home.path().join(".claude").into_os_string(),
+            ),
+            ("CODEX_HOME", home.path().join(".codex").into_os_string()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", "1".into()),
+            ("TOKSCALE_EXTRA_DIRS", "".into()),
+            ("TOKSCALE_HEADLESS_DIR", "".into()),
+        ];
+        let _restore = EnvRestore(
+            values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for (key, value) in values {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let clients = Some(vec!["claude".to_string(), "codex".to_string()]);
+        write_light_cache(
+            &None,
+            &clients,
+            &None,
+            &None,
+            &None,
+            &tokscale_core::GroupBy::default(),
+        );
+
+        let enabled = resolve_light_cache_filter_set(&clients);
+        let result = tui::load_cache(
+            &enabled,
+            &tui::TUI_DEFAULT_GROUP_BY,
+            &tui::CacheReportScope::default(),
+        );
+        assert!(matches!(result, tui::CacheResult::Fresh(_)));
+        assert!(matches!(
+            tui::load_cache(
+                &enabled,
+                &tokscale_core::GroupBy::default(),
+                &tui::CacheReportScope::default(),
+            ),
+            tui::CacheResult::Miss
+        ));
+    }
+
+    #[test]
     fn write_light_cache_refuses_when_home_dir_set() {
         // --home rebinds the scan root; DataLoader::load currently ignores
         // this field and resolves home from crate::paths::home_dir() with
@@ -9300,5 +11372,170 @@ mod tests {
             &None,
             &group_by,
         );
+    }
+    #[test]
+    fn submit_payload_never_contains_private_billing_diagnostics() {
+        let message = tokscale_core::UnifiedMessage::new(
+            "codex",
+            "gpt-5",
+            "openai",
+            "s",
+            1780000000000,
+            tokscale_core::TokenBreakdown {
+                input: 10,
+                ..Default::default()
+            },
+            0.25,
+        )
+        .with_billing(
+            Some("PRIVATE_BILLING_SENTINEL"),
+            tokscale_core::sessions::BillingIdentityOrigin::ExplicitRecord,
+        );
+        let private_json = serde_json::to_string(&message).unwrap();
+        assert!(private_json.contains("private_billing_sentinel"));
+        let contributions = tokscale_core::aggregate_by_date_v2(vec![message]);
+        let graph = graph_result_with_contributions(contributions);
+        let payload =
+            serde_json::to_string(&to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        assert!(!payload.to_lowercase().contains("private_billing_sentinel"));
+        assert!(!payload.contains("billingIdentity"));
+        assert!(!payload.contains("matchedProviderId"));
+        assert!(payload.contains("openai"));
+    }
+
+    #[test]
+    fn submit_payload_populates_retention_floors_for_full_history_clients() {
+        let graph = graph_result_with_contributions(vec![
+            day_with_clients(
+                "2026-08-07",
+                200,
+                vec![
+                    client_contribution("antigravity-cli", "gemini-3-pro", "google", 100, 0.1, 1),
+                    client_contribution("amp", "claude-sonnet-4", "anthropic", 100, 0.1, 1),
+                ],
+            ),
+            day_with_clients(
+                "2026-08-05",
+                100,
+                vec![client_contribution(
+                    "antigravity-cli",
+                    "gemini-3-pro",
+                    "google",
+                    100,
+                    0.1,
+                    1,
+                )],
+            ),
+        ]);
+        let clients = vec!["antigravity-cli".to_string(), "amp".to_string()];
+
+        let full_scope = submit_scan_scope(Some(&clients), true, true);
+        let full_payload = to_ts_token_contribution_data(&graph, None, full_scope);
+        let floors = full_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .expect("retention floors populated for full history");
+        assert_eq!(
+            floors.get("antigravity-cli").map(String::as_str),
+            Some("2026-08-05")
+        );
+        assert_eq!(floors.get("amp").map(String::as_str), Some("2026-08-07"));
+
+        let partial_amp_scope = submit_scan_scope(Some(&clients), true, false);
+        let partial_amp_payload = to_ts_token_contribution_data(&graph, None, partial_amp_scope);
+        let partial_floors = partial_amp_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .expect("retention floors populated for full_history_clients");
+        assert_eq!(
+            partial_floors.get("antigravity-cli").map(String::as_str),
+            Some("2026-08-05")
+        );
+        assert!(!partial_floors.contains_key("amp"));
+
+        // A bounded submit still ships snapshot-integrity clients complete and
+        // names them in `full_history_clients`, so their floors are populated.
+        // A lone atomic-family member is not exempted — the receiver's family
+        // contract needs every member — so antigravity-cli carries no floor
+        // until the whole trio is selected.
+        let solo_bounded = submit_scan_scope(Some(&clients), false, true);
+        let solo_payload = to_ts_token_contribution_data(&graph, None, solo_bounded);
+        let solo_floors = solo_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .expect("floor populated for amp on a bounded submit");
+        assert!(!solo_floors.contains_key("antigravity-cli"));
+        assert_eq!(
+            solo_floors.get("amp").map(String::as_str),
+            Some("2026-08-07")
+        );
+
+        let family_clients = vec![
+            "antigravity".to_string(),
+            "antigravity-cli".to_string(),
+            "antigravity-extension".to_string(),
+            "amp".to_string(),
+        ];
+        let bounded_scope = submit_scan_scope(Some(&family_clients), false, true);
+        let bounded_payload = to_ts_token_contribution_data(&graph, None, bounded_scope);
+        let bounded_floors = bounded_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .expect("floors populated for exempt clients on a bounded submit");
+        assert_eq!(
+            bounded_floors.get("antigravity-cli").map(String::as_str),
+            Some("2026-08-05")
+        );
+        assert_eq!(
+            bounded_floors.get("amp").map(String::as_str),
+            Some("2026-08-07")
+        );
+
+        // A bounded submit of only bounded-growth clients carries no floors.
+        let growth_only = submit_scan_scope(Some(&["codex".to_string()]), false, true);
+        let growth_payload = to_ts_token_contribution_data(&graph, None, growth_only);
+        assert!(growth_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .is_none());
+    }
+
+    #[test]
+    fn submit_metrics_deserializes_total_tokens_and_rejects_overflow() {
+        let from_int: SubmitMetrics =
+            serde_json::from_str(r#"{"totalTokens":240000,"totalCost":1.5}"#).unwrap();
+        assert_eq!(from_int.total_tokens, Some(240_000));
+
+        let from_str: SubmitMetrics =
+            serde_json::from_str(r#"{"totalTokens":"240000","totalCost":1.5}"#).unwrap();
+        assert_eq!(from_str.total_tokens, Some(240_000));
+
+        let from_float: SubmitMetrics =
+            serde_json::from_str(r#"{"totalTokens":240000.0,"totalCost":1.5}"#).unwrap();
+        assert_eq!(from_float.total_tokens, Some(240_000));
+
+        let from_null: SubmitMetrics =
+            serde_json::from_str(r#"{"totalTokens":null,"totalCost":1.5}"#).unwrap();
+        assert_eq!(from_null.total_tokens, None);
+
+        let from_omitted: SubmitMetrics = serde_json::from_str(r#"{"totalCost":1.5}"#).unwrap();
+        assert_eq!(from_omitted.total_tokens, None);
+
+        // u64::MAX must not silently wrap to -1
+        assert!(serde_json::from_str::<SubmitMetrics>(
+            r#"{"totalTokens":18446744073709551615,"totalCost":1.5}"#
+        )
+        .is_err());
+
+        // Non-integral floats must be rejected
+        assert!(serde_json::from_str::<SubmitMetrics>(
+            r#"{"totalTokens":240000.5,"totalCost":1.5}"#
+        )
+        .is_err());
     }
 }

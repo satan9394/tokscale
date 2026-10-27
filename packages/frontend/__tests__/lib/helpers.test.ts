@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyCostCompleteness,
   mergeClientBreakdownsWithRegressionGuard,
+  reapplyReplaceFamilyCostFloor,
   reapplyReplaceLayoutCostFloors,
   type ClientBreakdownData,
 } from "../../src/lib/db/helpers";
@@ -208,6 +209,82 @@ describe("mergeClientBreakdownsWithRegressionGuard", () => {
       expect(result.foldPreservedClients).toEqual(new Set(["kilo"]));
     });
   });
+
+  describe("suppressDisappearedNotices parameter (#1513 bounded-window noise)", () => {
+    // The flag exists for days a bounded submit dates only through its
+    // declared-complete clients: every other client's absence there is the
+    // date filter, not a disappearance. It must change WARNING OUTPUT ONLY —
+    // the merged bytes and the fold bookkeeping must be identical, or the
+    // flag would silently alter stored history.
+    const cases: Array<[string, Record<string, ClientBreakdownData>, Record<string, ClientBreakdownData>]> = [
+      [
+        "disappeared client with tokens (preserve + derive provenance)",
+        { codex: makeClient(1000, 5, 2), cursor: makeClient(500, 3, 1) },
+        { codex: makeClient(1200, 6, 2) },
+      ],
+      [
+        "disappeared client with zero tokens (cell dropped)",
+        { codex: makeClient(1000, 5, 2), cursor: makeClient(0, 0, 0) },
+        { codex: makeClient(1200, 6, 2) },
+      ],
+      [
+        "token-regression preserve for a present client",
+        { codex: makeClient(1000, 5, 2) },
+        { codex: makeClient(800, 5, 2) },
+      ],
+      ["normal growth", { codex: makeClient(800, 4, 2) }, { codex: makeClient(1000, 5, 2) }],
+    ];
+
+    for (const [name, existing, incoming] of cases) {
+      it(`keeps merged bytes identical: ${name}`, () => {
+        const clients = new Set([...Object.keys(existing), ...Object.keys(incoming)]);
+        const loud = mergeClientBreakdownsWithRegressionGuard(
+          structuredClone(existing),
+          structuredClone(incoming),
+          new Set(clients),
+          undefined,
+          true,
+          false
+        );
+        const suppressed = mergeClientBreakdownsWithRegressionGuard(
+          structuredClone(existing),
+          structuredClone(incoming),
+          new Set(clients),
+          undefined,
+          true,
+          true
+        );
+
+        expect(JSON.stringify(suppressed.merged)).toBe(JSON.stringify(loud.merged));
+        expect(suppressed.foldPreservedClients).toEqual(loud.foldPreservedClients);
+        // Only the disappeared notices are dropped; every other warning stays.
+        expect(suppressed.warnings).toEqual(
+          loud.warnings.filter((warning) => !warning.includes("disappeared"))
+        );
+      });
+    }
+
+    it("still emits non-disappeared warnings while suppressing", () => {
+      const existing = { codex: makeClient(1000, 5, 2), cursor: makeClient(500, 3, 1) };
+      const incoming = { codex: makeClient(800, 5, 2) };
+
+      const result = mergeClientBreakdownsWithRegressionGuard(
+        existing,
+        incoming,
+        new Set(["codex", "cursor"]),
+        undefined,
+        true,
+        true
+      );
+
+      // The codex token-regression preserve still warns; only cursor's
+      // disappeared notice is suppressed.
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain("codex");
+      expect(result.warnings[0]).not.toContain("disappeared");
+      expect(result.merged.cursor.tokens).toBe(500);
+    });
+  });
 });
 
 describe("applyCostCompleteness", () => {
@@ -312,5 +389,156 @@ describe("reapplyReplaceLayoutCostFloors", () => {
     expect(cell.models["model-0"].cost).toBe(30);
     expect(cell.models["model-1"].cost).toBe(10);
     expect(cell.cost).toBe(40);
+  });
+});
+
+
+describe("reapplyReplaceFamilyCostFloor", () => {
+  const family = ["antigravity", "antigravity-cli", "antigravity-extension"] as const;
+
+  function cell(
+    tokens: number,
+    cost: number,
+    complete: boolean
+  ): ClientBreakdownData {
+    return {
+      tokens,
+      cost,
+      input: tokens,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      messages: tokens,
+      models: {
+        "gemini-3-pro": {
+          tokens,
+          cost,
+          input: tokens,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          reasoning: 0,
+          messages: tokens,
+        },
+      },
+      ...(complete
+        ? {}
+        : {
+            provenance: {
+              schemaVersion: 2,
+              messageCount: 1,
+              modelCount: 1,
+              costIsComplete: false,
+            },
+          }),
+    };
+  }
+
+  it("restores the family lifetime deficit after the original source disappears", () => {
+    // Prior credited family cost was $10 on the desktop source. The
+    // replacement carries the usage on the extension only, unpriced: without
+    // a family-wide floor the $10 is lost (the per-client floor keyed on the
+    // desktop has no cells to land on).
+    const rows = [
+      {
+        sourceBreakdown: {
+          "antigravity-extension": cell(100, 0, false),
+        },
+      },
+    ];
+    reapplyReplaceFamilyCostFloor(rows, family, 10);
+    expect(rows[0].sourceBreakdown["antigravity-extension"]!.cost).toBeCloseTo(10, 8);
+    expect(
+      rows[0].sourceBreakdown["antigravity-extension"]!.models["gemini-3-pro"]!.cost
+    ).toBeCloseTo(10, 8);
+  });
+
+  it("counts complete sibling cells toward the family total without flooring them", () => {
+    // $10 prior family cost, replacement has a COMPLETE $10 extension cell
+    // plus an INCOMPLETE $0 desktop cell: the family total already reaches
+    // the floor, so nothing is added and the complete cell stays exact.
+    const rows = [
+      {
+        sourceBreakdown: {
+          "antigravity-extension": cell(60, 10, true),
+          antigravity: cell(40, 0, false),
+        },
+      },
+    ];
+    reapplyReplaceFamilyCostFloor(rows, family, 10);
+    expect(rows[0].sourceBreakdown["antigravity-extension"]!.cost).toBeCloseTo(10, 8);
+    expect(rows[0].sourceBreakdown.antigravity!.cost).toBeCloseTo(0, 8);
+  });
+
+  it("spreads the deficit only over incomplete cells, complete cells stay exact", () => {
+    const rows = [
+      {
+        sourceBreakdown: {
+          "antigravity-extension": cell(60, 7, true),
+          "antigravity-cli": cell(40, 0, false),
+        },
+      },
+    ];
+    reapplyReplaceFamilyCostFloor(rows, family, 10);
+    // $7 complete stays exact; the $3 deficit lands on the incomplete cell.
+    expect(rows[0].sourceBreakdown["antigravity-extension"]!.cost).toBeCloseTo(7, 8);
+    expect(rows[0].sourceBreakdown["antigravity-cli"]!.cost).toBeCloseTo(3, 8);
+    expect(
+      rows[0].sourceBreakdown["antigravity-cli"]!.models["gemini-3-pro"]!.cost
+    ).toBeCloseTo(3, 8);
+    expect(
+      rows[0].sourceBreakdown["antigravity-cli"]!.provenance?.costIsComplete
+    ).toBe(false);
+  });
+
+  it("leaves a fully priced replacement alone (the floor is not a ratchet)", () => {
+    const rows = [
+      {
+        sourceBreakdown: {
+          "antigravity-extension": cell(100, 6, true),
+        },
+      },
+    ];
+    reapplyReplaceFamilyCostFloor(rows, family, 10);
+    expect(rows[0].sourceBreakdown["antigravity-extension"]!.cost).toBeCloseTo(6, 8);
+  });
+
+  it("spreads a fractional deficit deterministically across dates and members", () => {
+    const rows: Array<{ sourceBreakdown: Record<string, ClientBreakdownData> }> = [
+      {
+        sourceBreakdown: {
+          "antigravity-cli": cell(10, 0, false),
+        },
+      },
+      {
+        sourceBreakdown: {
+          "antigravity-extension": cell(30, 0, false),
+        },
+      },
+    ];
+    reapplyReplaceFamilyCostFloor(rows, family, 0.1);
+    const first = rows[0].sourceBreakdown["antigravity-cli"]!.cost;
+    const second = rows[1].sourceBreakdown["antigravity-extension"]!.cost;
+    expect(first + second).toBeCloseTo(0.1, 8);
+    expect(first).toBeCloseTo(0.025, 8);
+    expect(second).toBeCloseTo(0.075, 8);
+
+    // Replay with the same shapes reproduces the same placement.
+    const replay: Array<{ sourceBreakdown: Record<string, ClientBreakdownData> }> = [
+      {
+        sourceBreakdown: {
+          "antigravity-cli": cell(10, 0, false),
+        },
+      },
+      {
+        sourceBreakdown: {
+          "antigravity-extension": cell(30, 0, false),
+        },
+      },
+    ];
+    reapplyReplaceFamilyCostFloor(replay, family, 0.1);
+    expect(replay[0].sourceBreakdown["antigravity-cli"]!.cost).toBeCloseTo(first, 8);
+    expect(replay[1].sourceBreakdown["antigravity-extension"]!.cost).toBeCloseTo(second, 8);
   });
 });

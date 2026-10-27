@@ -6,7 +6,8 @@
 //!
 //! - Current OpenClaw (2026.x) writes every live transcript into a per-agent
 //!   SQLite database, `~/.openclaw/agents/<agentId>/agent/openclaw-agent.sqlite`,
-//!   table `transcript_events(session_id, seq, event_json, created_at)`.
+//!   table `transcript_events`. Payloads are either `event_json` text or zstd
+//!   `event_zstd` blobs with their decoded length in `event_utf8_bytes`.
 //! - Legacy installs wrote one JSONL file per session under
 //!   `~/.openclaw/agents/<agentId>/sessions/`, indexed by `sessions.json`.
 //!   Current OpenClaw still publishes `<id>.jsonl.deleted.<ts>` /
@@ -33,14 +34,13 @@
 //! record of that turn when it has one.
 
 use super::utils::{
-    file_modified_timestamp_ms, for_each_json_line, lossy_lines, open_readonly_sqlite,
+    file_modified_timestamp_ms, for_each_archive_line, for_each_json_line, open_readonly_sqlite,
     parse_json_line, read_file_or_none, sqlite_for_each_row_on, timestamp_secs_to_ms, CamelUsage,
-    SqliteScan,
+    MAX_ARCHIVE_BYTES,
 };
 use super::UnifiedMessage;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -184,40 +184,18 @@ pub(crate) fn classify_openclaw_jsonl(path: &Path) -> OpenClawJsonlKind {
 /// checkpoint or recovery can hold an exclusive lock for a moment.
 const OPENCLAW_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(1500);
 
-// Archived transcripts are immutable zstd files. Bound expansion before parsing
-// so a corrupt archive cannot allocate its advertised decoded size.
-const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
-
-fn read_archive(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let mut decoder = zstd::stream::read::Decoder::new(file)?;
-    decoder.window_log_max(26)?;
-    let mut bytes = Vec::new();
-    decoder.take(max_bytes + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(std::io::Error::other(
-            "decoded transcript exceeds archive limit",
-        ));
-    }
-    Ok(bytes)
-}
-
-fn for_each_transcript_line(path: &Path, sink: &mut dyn FnMut(usize, &str)) {
+fn for_each_transcript_line(path: &Path, sink: &mut dyn FnMut(usize, &str)) -> bool {
     if path.extension().is_none_or(|extension| extension != "zst") {
         for_each_json_line(path, sink);
-        return;
+        return true;
     }
 
-    match read_archive(path, MAX_ARCHIVE_BYTES) {
-        Ok(bytes) => {
-            for (index, line) in lossy_lines(bytes.as_slice()).enumerate() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    sink(index, trimmed);
-                }
-            }
+    match for_each_archive_line(path, MAX_ARCHIVE_BYTES, sink) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "Skipping OpenClaw archive");
+            false
         }
-        Err(error) => tracing::warn!(path = %path.display(), %error, "Skipping OpenClaw archive"),
     }
 }
 
@@ -387,20 +365,42 @@ fn ingest_openclaw_entry(
                 .map(|turn| (turn.thread.to_string(), turn.turn.map(str::to_string)));
             let usage = msg.usage?;
 
-            let model = msg
-                .model
-                .and_then(non_empty)
+            let message_model = msg.model.and_then(non_empty);
+            let model = message_model
+                .clone()
                 .or_else(|| state.current_model.clone().and_then(non_empty))
                 .or_else(|| ctx.session_model.map(str::to_string).and_then(non_empty))?;
-            let provider = msg
-                .provider
-                .and_then(non_empty)
-                .or_else(|| state.current_provider.clone().and_then(non_empty))
+            let message_provider = msg.provider.and_then(non_empty);
+            let observed_provider = message_provider
+                .clone()
+                .or_else(|| state.current_provider.clone().and_then(non_empty));
+            let provider = observed_provider
+                .clone()
                 .or_else(|| ctx.session_provider.map(str::to_string).and_then(non_empty))
                 .unwrap_or_else(|| "unknown".to_string());
+            let billing_identity = if let Some(provider) = message_provider.as_deref() {
+                super::BillingIdentity::from_explicit(
+                    Some(provider),
+                    super::BillingIdentityOrigin::ExplicitRecord,
+                )
+            } else if let Some(provider) = observed_provider.as_deref() {
+                super::BillingIdentity::from_explicit(
+                    Some(provider),
+                    super::BillingIdentityOrigin::ExplicitSession,
+                )
+            } else {
+                // `session_windows` stores only the session's current route. It
+                // is useful attribution fallback, but cannot establish which
+                // route an older transcript event was billed through.
+                super::BillingIdentity::Unknown
+            };
 
-            state.current_model = Some(model.clone());
-            state.current_provider = Some(provider.clone());
+            if let Some(model) = message_model {
+                state.current_model = Some(model);
+            }
+            if let Some(provider) = message_provider {
+                state.current_provider = Some(provider);
+            }
             let timestamp = msg.timestamp.unwrap_or(ctx.fallback_timestamp);
             let cost = usage.cost.as_ref().and_then(|c| c.total).unwrap_or(0.0);
             let tokens = usage.to_breakdown_with_reasoning();
@@ -416,7 +416,7 @@ fn ingest_openclaw_entry(
                 )
             });
 
-            Some(UnifiedMessage::new_with_dedup(
+            let mut message = UnifiedMessage::new_with_dedup(
                 "openclaw",
                 model,
                 provider,
@@ -425,7 +425,9 @@ fn ingest_openclaw_entry(
                 tokens,
                 cost.max(0.0),
                 dedup_key,
-            ))
+            );
+            message.billing_identity = billing_identity;
+            Some(message)
         }
         _ => None,
     }
@@ -532,7 +534,7 @@ fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedM
     let mut state = OpenClawSessionState::default();
     let mut buffer = Vec::with_capacity(4096);
 
-    for_each_transcript_line(session_path, &mut |_index, trimmed| {
+    let ok = for_each_transcript_line(session_path, &mut |_index, trimmed| {
         let Some(entry) = parse_json_line::<OpenClawEntry>(trimmed, &mut buffer) else {
             return;
         };
@@ -541,50 +543,48 @@ fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedM
         }
     });
 
+    if !ok {
+        return Vec::new();
+    }
+
     messages
 }
 
-/// Transcript rows joined with the session window that owns them.
-///
-/// `instr` prefilters in SQLite so only rows that can matter — assistant
-/// messages with a `usage` block and the model bookkeeping events — leave the
-/// database; user prompts and tool results, which are the bulk of a live
-/// transcript store, are never copied out or JSON-decoded. Every key it looks
-/// for is a JSON string token, so the check does not depend on how the writer
-/// spaced or escaped the document. `ORDER BY` follows the primary key, so the
-/// scan streams in storage order without a sort.
-const TRANSCRIPT_EVENTS_QUERY_WITH_SESSION_WINDOWS: &str = r#"
-        SELECT e.session_id, e.event_json, e.created_at, w.model_provider, w.model
-        FROM transcript_events e
-        LEFT JOIN session_windows w ON w.session_id = e.session_id
-        WHERE instr(e.event_json, '"usage"') > 0
-           OR instr(e.event_json, '"model_change"') > 0
-           OR instr(e.event_json, '"model-snapshot"') > 0
-        ORDER BY e.session_id, e.seq
-"#;
+// OpenClaw's transcript-payload.ts bounds both the zstd frame and its decoded
+// UTF-8 bytes at 4 MiB. Check before allocating, including on damaged stores.
+const MAX_COMPRESSED_EVENT_BYTES: i64 = 4 * 1024 * 1024;
 
-/// Same projection against the pre-`session_windows` schema, which kept the
-/// session rows in a `sessions` table.
-const TRANSCRIPT_EVENTS_QUERY_WITH_SESSIONS: &str = r#"
-        SELECT e.session_id, e.event_json, e.created_at, s.model_provider, s.model
-        FROM transcript_events e
-        LEFT JOIN sessions s ON s.session_id = e.session_id
-        WHERE instr(e.event_json, '"usage"') > 0
-           OR instr(e.event_json, '"model_change"') > 0
-           OR instr(e.event_json, '"model-snapshot"') > 0
-        ORDER BY e.session_id, e.seq
-"#;
+fn decode_compressed_event(payload: &[u8], raw_bytes: i64) -> std::io::Result<String> {
+    if !(1..=MAX_COMPRESSED_EVENT_BYTES).contains(&raw_bytes)
+        || payload.is_empty()
+        || payload.len() > MAX_COMPRESSED_EVENT_BYTES as usize
+    {
+        return Err(std::io::Error::other(
+            "invalid compressed transcript payload bounds",
+        ));
+    }
+    let decoded = zstd::bulk::decompress(payload, raw_bytes as usize)?;
+    if decoded.len() != raw_bytes as usize {
+        return Err(std::io::Error::other(
+            "compressed transcript payload length mismatch",
+        ));
+    }
+    String::from_utf8(decoded).map_err(std::io::Error::other)
+}
 
-/// Last resort for a schema whose session table is missing or lacks the
-/// model columns: the transcript alone, with NULL session fallbacks.
-const TRANSCRIPT_EVENTS_QUERY_BARE: &str = r#"
-        SELECT e.session_id, e.event_json, e.created_at, NULL, NULL
-        FROM transcript_events e
-        WHERE instr(e.event_json, '"usage"') > 0
-           OR instr(e.event_json, '"model_change"') > 0
-           OR instr(e.event_json, '"model-snapshot"') > 0
-        ORDER BY e.session_id, e.seq
-"#;
+fn transcript_event_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    if let Some(json) = row.get::<_, Option<String>>(1)? {
+        return Ok(json);
+    }
+    // Borrow the blob so even an oversized corrupt row is checked before copying.
+    let value = row.get_ref(5)?;
+    let payload = value.as_blob().map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(5, value.data_type(), Box::new(err))
+    })?;
+    decode_compressed_event(payload, row.get(6)?).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(5, value.data_type(), Box::new(err))
+    })
+}
 
 /// Whether the store has a `transcript_events` table. `Err` when the probe
 /// itself failed — a store another process holds exclusively, an unreadable
@@ -606,8 +606,8 @@ fn has_transcript_events_table(conn: &rusqlite::Connection) -> rusqlite::Result<
 pub(crate) struct OpenClawSqliteScan {
     pub messages: Vec<UnifiedMessage>,
     /// False when the store was not read to the end: it could not be opened,
-    /// or iteration stopped partway. `messages` is then a prefix of the
-    /// store, worth reporting for this scan (a lower bound beats nothing)
+    /// iteration stopped partway, or a payload could not be decoded. `messages`
+    /// is then a subset of the store, worth reporting (a lower bound beats nothing)
     /// but not worth caching, or every later scan would replay the shortfall
     /// until the file happens to change. A store with no transcript table is
     /// complete: there was nothing to read.
@@ -687,16 +687,17 @@ pub(crate) fn scan_openclaw_sqlite(db_path: &Path) -> OpenClawSqliteScan {
     let mut current_session: Option<String> = None;
     let mut state = OpenClawSessionState::default();
     let mut malformed_rows: usize = 0;
+    let mut payload_failed = false;
 
     let query = transcript_events_query(&conn);
     let scan = sqlite_for_each_row_on(
         &conn,
         db_path,
-        query,
+        &query,
         Some("OpenClaw transcript event"),
         &mut |row| {
             let session_id: String = row.get(0)?;
-            let event_json: String = row.get(1)?;
+            let event_json = transcript_event_json(row).inspect_err(|_| payload_failed = true)?;
             // Read as f64 so an INTEGER or a REAL column both decode; a row
             // that failed here would be skipped silently.
             let created_at: Option<f64> = row.get(2)?;
@@ -741,15 +742,8 @@ pub(crate) fn scan_openclaw_sqlite(db_path: &Path) -> OpenClawSqliteScan {
     }
 
     // The driver has already logged what went wrong under the label above;
-    // what is left to decide is whether `messages` is the store or a prefix
-    // of it. Only a scan that iterated to the end is the store.
-    let complete = match scan {
-        SqliteScan::Ran => true,
-        SqliteScan::Incomplete
-        | SqliteScan::NotExecuted
-        | SqliteScan::NotPrepared
-        | SqliteScan::NotOpened => false,
-    };
+    // do not cache a lower bound after iteration or payload decoding failed.
+    let complete = scan.completed() && !payload_failed;
     OpenClawSqliteScan { messages, complete }
 }
 
@@ -763,16 +757,47 @@ pub(crate) fn scan_openclaw_sqlite(db_path: &Path) -> OpenClawSqliteScan {
 /// query that runs is the one that logs. Preparing the query itself rather
 /// than a probe of the columns it needs means a schema the query cannot
 /// run against falls through to the next one instead of failing the read.
-fn transcript_events_query(conn: &rusqlite::Connection) -> &'static str {
-    for query in [
-        TRANSCRIPT_EVENTS_QUERY_WITH_SESSION_WINDOWS,
-        TRANSCRIPT_EVENTS_QUERY_WITH_SESSIONS,
+fn transcript_events_query(conn: &rusqlite::Connection) -> String {
+    let payload_columns = if conn
+        .prepare("SELECT event_zstd, event_utf8_bytes FROM transcript_events")
+        .is_ok()
+    {
+        "e.event_zstd, e.event_utf8_bytes"
+    } else {
+        "NULL, NULL"
+    };
+    let mut query = String::new();
+    for (model_columns, join) in [
+        (
+            "s.model_provider, s.model",
+            "LEFT JOIN session_windows s ON s.session_id = e.session_id",
+        ),
+        (
+            "s.model_provider, s.model",
+            "LEFT JOIN sessions s ON s.session_id = e.session_id",
+        ),
+        ("NULL, NULL", ""),
     ] {
-        if conn.prepare(query).is_ok() {
-            return query;
+        // Keep the text prefilter, but NULL text requires decoding the blob:
+        // compressed model events must reach the same ingest path as usage.
+        // ORDER BY follows the primary key and preserves per-session history.
+        query = format!(
+            r#"
+            SELECT e.session_id, e.event_json, e.created_at, {model_columns}, {payload_columns}
+            FROM transcript_events e
+            {join}
+            WHERE e.event_json IS NULL
+               OR instr(e.event_json, '"usage"') > 0
+               OR instr(e.event_json, '"model_change"') > 0
+               OR instr(e.event_json, '"model-snapshot"') > 0
+            ORDER BY e.session_id, e.seq
+        "#
+        );
+        if conn.prepare(&query).is_ok() {
+            break;
         }
     }
-    TRANSCRIPT_EVENTS_QUERY_BARE
+    query
 }
 
 /// Synthetic per-agent database fixtures shared by the parser, scanner and
@@ -817,6 +842,20 @@ pub(crate) mod test_fixtures {
     /// Create `path` with the transcript schema in WAL mode, the journal mode
     /// a running OpenClaw gateway keeps its store in.
     pub(crate) fn create_agent_db(path: &Path) -> Connection {
+        create_agent_db_with_schema(path, AGENT_DB_SCHEMA)
+    }
+
+    pub(crate) fn create_compressed_agent_db(path: &Path) -> Connection {
+        create_agent_db_with_schema(
+            path,
+            &AGENT_DB_SCHEMA.replace(
+                "event_json TEXT NOT NULL,",
+                "event_json TEXT, event_zstd BLOB, event_utf8_bytes INTEGER, navigation_json TEXT,",
+            ),
+        )
+    }
+
+    fn create_agent_db_with_schema(path: &Path, schema: &str) -> Connection {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -825,8 +864,26 @@ pub(crate) mod test_fixtures {
             .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal_mode.to_lowercase(), "wal");
-        conn.execute_batch(AGENT_DB_SCHEMA).unwrap();
+        conn.execute_batch(schema).unwrap();
         conn
+    }
+
+    pub(crate) fn insert_compressed_event(
+        conn: &Connection,
+        session_id: &str,
+        seq: i64,
+        event_json: &str,
+        created_at: i64,
+    ) {
+        let mut compressor = zstd::bulk::Compressor::new(1).unwrap();
+        compressor.include_checksum(true).unwrap();
+        let compressed = compressor.compress(event_json.as_bytes()).unwrap();
+        conn.execute(
+            "INSERT INTO transcript_events (session_id, seq, event_zstd, event_utf8_bytes, navigation_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, '{}', ?5)",
+            params![session_id, seq, compressed, event_json.len() as i64, created_at],
+        )
+        .unwrap();
     }
 
     pub(crate) fn insert_session_window(
@@ -949,9 +1006,11 @@ mod tests {
     fn compressed_archive_enforces_decoded_limit() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("session.jsonl.zst");
-        std::fs::write(&path, zstd::encode_all(&b"12345"[..], 0).unwrap()).unwrap();
-        assert_eq!(read_archive(&path, 5).unwrap(), b"12345");
-        assert!(read_archive(&path, 4).is_err());
+        std::fs::write(&path, zstd::encode_all(&b"12345\n"[..], 0).unwrap()).unwrap();
+        let mut lines = Vec::new();
+        assert!(for_each_archive_line(&path, 6, |_idx, line| lines.push(line.to_string())).is_ok());
+        assert_eq!(lines, vec!["12345"]);
+        assert!(for_each_archive_line(&path, 4, |_idx, _line| ()).is_err());
     }
 
     #[test]
@@ -1276,11 +1335,145 @@ mod tests {
     // ---- SQLite transcript store ------------------------------------------------
 
     use super::test_fixtures::{
-        assistant_event, create_agent_db, header_event, insert_event, insert_session_window,
-        user_event,
+        assistant_event, create_agent_db, create_compressed_agent_db, header_event,
+        insert_compressed_event, insert_event, insert_session_window, user_event,
     };
 
     const USAGE_FULL: &str = r#"{"input":100,"output":50,"cacheRead":200,"cacheWrite":10,"reasoningTokens":20,"totalTokens":360,"cost":{"input":0.001,"output":0.002,"cacheRead":0.0005,"cacheWrite":0.0001,"total":0.0036}}"#;
+
+    #[test]
+    fn sqlite_compressed_payloads_preserve_usage_and_model_history() {
+        let dir = TempDir::new().unwrap();
+        let events = [
+            r#"{"type":"model_change","provider":"openai","modelId":"gpt-4.1"}"#.to_string(),
+            assistant_event("a1", "", "", USAGE_FULL, 1_756_548_001_000),
+            r#"{"type":"custom","customType":"model-snapshot","data":{"provider":"anthropic","modelId":"claude-sonnet-4-6"}}"#.to_string(),
+            assistant_event("a2", "", "", USAGE_FULL, 1_756_548_002_000).replace("\"ok\"", &format!("\"{}\"", "こんにちは🦊".repeat(200))),
+            user_event("u1", "ignored"),
+            r#"{"type":"message","message":{"role":"toolResult","usage":{"input":999}}}"#.to_string(),
+            r#"{"type":"message","message":{"role":"assistant","api":"openclaw-transcript","usage":{"input":999}}}"#.to_string(),
+        ];
+        let jsonl = dir.path().join("sess-a.jsonl");
+        std::fs::write(&jsonl, events.join("\n")).unwrap();
+        let expected = parse_openclaw_transcript(&jsonl);
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0].model_id, "gpt-4.1");
+        assert_eq!(expected[1].model_id, "claude-sonnet-4-6");
+
+        // Storage encoding and session-table availability are independent.
+        for table in ["session_windows", "sessions", "missing", "missing_columns"] {
+            for encoding in ["identity", "mixed", "compressed"] {
+                let path = dir.path().join(format!("{table}-{encoding}.sqlite"));
+                let conn = create_compressed_agent_db(&path);
+                insert_session_window(&conn, "sess-a", Some("openai"), Some("gpt-4.1-mini"), None);
+                match table {
+                    "sessions" => conn
+                        .execute_batch("ALTER TABLE session_windows RENAME TO sessions;")
+                        .unwrap(),
+                    "missing" => conn.execute_batch("DROP TABLE session_windows;").unwrap(),
+                    "missing_columns" => conn
+                        .execute_batch("ALTER TABLE session_windows DROP COLUMN model;")
+                        .unwrap(),
+                    _ => {}
+                }
+                for (seq, event) in events.iter().enumerate() {
+                    let insert =
+                        if encoding == "compressed" || (encoding == "mixed" && seq % 2 == 0) {
+                            insert_compressed_event
+                        } else {
+                            insert_event
+                        };
+                    insert(&conn, "sess-a", seq as i64, event, 1_756_548_000_000);
+                }
+                drop(conn);
+                let scan = scan_openclaw_sqlite(&path);
+                assert!(scan.complete, "{table}/{encoding}");
+                assert_eq!(scan.messages, expected, "{table}/{encoding}");
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_invalid_compressed_payloads_skip_only_the_bad_row_without_caching() {
+        let dir = TempDir::new().unwrap();
+        let event = assistant_event("a1", "openai", "gpt-4.1", USAGE_FULL, 1_756_548_001_000);
+        let mut compressor = zstd::bulk::Compressor::new(1).unwrap();
+        compressor.include_checksum(true).unwrap();
+        let compressed = compressor.compress(event.as_bytes()).unwrap();
+        let mut bad_checksum = compressed.clone();
+        *bad_checksum.last_mut().unwrap() ^= 1;
+        let invalid_utf8 = compressor.compress(&[0xff]).unwrap();
+        let oversized = compressor
+            .compress(&vec![b' '; 4 * 1024 * 1024 + 1])
+            .unwrap();
+        for (label, payload, raw_bytes) in [
+            ("corrupt", b"not zstd".to_vec(), event.len() as i64),
+            (
+                "truncated",
+                compressed[..compressed.len() - 1].to_vec(),
+                event.len() as i64,
+            ),
+            ("checksum", bad_checksum, event.len() as i64),
+            ("too_short", compressed.clone(), event.len() as i64 - 1),
+            ("too_long", compressed.clone(), event.len() as i64 + 1),
+            ("zero_length", compressed.clone(), 0),
+            ("negative_length", compressed.clone(), -1),
+            ("large_length", compressed, 4 * 1024 * 1024 + 1),
+            ("large_expansion", oversized, 4 * 1024 * 1024),
+            ("large_blob", vec![0; 4 * 1024 * 1024 + 1], 1),
+            ("empty_blob", vec![], 1),
+            ("invalid_utf8", invalid_utf8, 1),
+        ] {
+            let path = dir.path().join(format!("{label}.sqlite"));
+            // Omit the producer's CHECK constraints to exercise damaged stores.
+            let conn = create_compressed_agent_db(&path);
+            insert_event(&conn, "sess-a", 0, &event, 1_756_548_001_000);
+            conn.execute(
+                "INSERT INTO transcript_events (session_id, seq, event_zstd, event_utf8_bytes, created_at) VALUES ('sess-a', 1, ?1, ?2, 1756548001000)",
+                rusqlite::params![payload, raw_bytes],
+            ).unwrap();
+            insert_compressed_event(
+                &conn,
+                "sess-a",
+                2,
+                &event.replace("a1", "a2"),
+                1_756_548_001_000,
+            );
+            drop(conn);
+            let scan = scan_openclaw_sqlite(&path);
+            assert_eq!(scan.messages.len(), 2, "{label}");
+            assert!(
+                !scan.complete,
+                "{label}: an undecoded payload must not be cached"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_compressed_payloads_keep_timestamp_fallback_and_skip_malformed_json() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agent.sqlite");
+        let conn = create_compressed_agent_db(&path);
+        insert_session_window(&conn, "sess-a", Some("openai"), Some("gpt-4.1"), None);
+        insert_compressed_event(&conn, "sess-a", 0, "not JSON", 1);
+        insert_compressed_event(
+            &conn,
+            "sess-a",
+            1,
+            r#"{"type":"message","id":"a1","message":{"role":"assistant","usage":{"input":100,"output":20}}}"#,
+            1_756_548_001,
+        );
+        drop(conn);
+        let scan = scan_openclaw_sqlite(&path);
+        assert!(scan.complete);
+        assert_eq!(scan.messages.len(), 1);
+        assert_eq!(scan.messages[0].timestamp, 1_756_548_001_000);
+        assert_eq!(scan.messages[0].model_id, "gpt-4.1");
+        assert_eq!(
+            scan.messages[0].dedup_key.as_deref(),
+            Some("openclaw:a1:100:20")
+        );
+    }
 
     #[test]
     fn test_parse_openclaw_sqlite_parses_assistant_usage_fields() {
@@ -1647,6 +1840,27 @@ mod tests {
                     "message-provider",
                     "message-model"
                 ),
+            ]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.billing_identity.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                crate::sessions::BillingIdentity::Unknown,
+                crate::sessions::BillingIdentity::Known {
+                    id: "event-provider".into(),
+                    origin: crate::sessions::BillingIdentityOrigin::ExplicitSession,
+                },
+                crate::sessions::BillingIdentity::Known {
+                    id: "message-provider".into(),
+                    origin: crate::sessions::BillingIdentityOrigin::ExplicitRecord,
+                },
+                crate::sessions::BillingIdentity::Known {
+                    id: "message-provider".into(),
+                    origin: crate::sessions::BillingIdentityOrigin::ExplicitSession,
+                },
             ]
         );
     }

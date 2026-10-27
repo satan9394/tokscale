@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use tokscale_core::ClientId;
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,21 +21,55 @@ pub struct ClientDiagnostic {
 }
 
 const CLAUDE_DESKTOP_MESSAGE: &str =
-    "Claude Desktop app data was detected, but Tokscale counts Claude Code JSONL transcripts only.";
+    "Claude Desktop app data was detected. Local transcripts and available conversation-cache counters are included; the cache is not a complete account history.";
 
-const CLAUDE_DESKTOP_HELP: &str = "Claude Desktop chat storage and Claude data exports do not expose a documented per-message token ledger. Use `tokscale usage` for Claude subscription quota bars; organization/API billing requires Anthropic Admin Usage/Cost API outside local scanning.";
+const CLAUDE_DESKTOP_HELP: &str = "All model IDs with recorded usage are accepted. Undated cumulative balances appear only in all-time local totals; truncated trees, counter resets and chats without usage can leave gaps. Dates and tokens are never inferred from chat text.";
 
-pub fn diagnostics_for_clients_row(home_dir: &Path, use_env_roots: bool) -> Vec<ClientDiagnostic> {
-    claude_diagnostics(home_dir, use_env_roots, true)
+/// Terminal color for a diagnostic headline. Informational notes are dimmed so
+/// static coverage notes do not look like setup problems; warnings and any
+/// other severity stay yellow.
+pub fn severity_color(severity: &str) -> colored::Color {
+    match severity {
+        "info" => colored::Color::BrightBlack,
+        _ => colored::Color::Yellow,
+    }
+}
+
+pub fn diagnostics_for_clients_row(
+    client: ClientId,
+    home_dir: &Path,
+    use_env_roots: bool,
+) -> Vec<ClientDiagnostic> {
+    match client {
+        ClientId::Claude => {
+            let mut diagnostics = claude_diagnostics(home_dir, use_env_roots, true);
+            diagnostics.push(ClientDiagnostic {
+                code: "claude_cloud_history_not_synced",
+                severity: "info",
+                message: "Claude Code cloud sessions are not fetched automatically.",
+                help: "Only locally available transcripts and retained Claude Desktop cache entries with recorded usage can be counted. Retained history may be incomplete; missing tokens are not inferred from conversation text.",
+                paths: Vec::new(),
+            });
+            diagnostics
+        }
+        ClientId::Codex => vec![ClientDiagnostic {
+            code: "codex_cloud_history_not_synced",
+            severity: "info",
+            message: "Codex cloud task history is not fetched automatically.",
+            help: "Run tokscale codex activity for a separate account snapshot. Its token accounting may differ from local rollouts, so account-minus-local is not a cloud usage total.",
+            paths: Vec::new(),
+        }],
+        _ => Vec::new(),
+    }
 }
 
 pub fn diagnostics_for_empty_explicit_report(
     home_dir: &Path,
     use_env_roots: bool,
     clients: &Option<Vec<String>>,
-    claude_message_count: i32,
+    _claude_message_count: i32,
 ) -> Vec<ClientDiagnostic> {
-    if !explicitly_requests_claude(clients) || claude_message_count > 0 {
+    if clients.as_ref().is_some_and(|ids| !ids.is_empty()) && !explicitly_requests_claude(clients) {
         return Vec::new();
     }
 
@@ -62,7 +97,7 @@ fn claude_diagnostics(
 
     if !desktop_paths.is_empty() {
         diagnostics.push(ClientDiagnostic {
-            code: "claude_desktop_not_scanned",
+            code: "claude_desktop_partial_history",
             severity: "warning",
             message: CLAUDE_DESKTOP_MESSAGE,
             help: CLAUDE_DESKTOP_HELP,
@@ -131,4 +166,18 @@ fn diagnostic_paths(claude_root: &Path, desktop_paths: Vec<PathBuf>) -> Vec<Diag
     }
 
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::severity_color;
+    use colored::Color;
+
+    #[test]
+    fn severity_color_dims_info_and_keeps_warning_yellow() {
+        assert_eq!(severity_color("info"), Color::BrightBlack);
+        assert_eq!(severity_color("warning"), Color::Yellow);
+        assert_eq!(severity_color("error"), Color::Yellow);
+        assert_eq!(severity_color(""), Color::Yellow);
+    }
 }

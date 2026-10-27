@@ -9,18 +9,25 @@ const PRICING_URL: &str =
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelPricing {
     pub input_cost_per_token: Option<f64>,
+    pub input_cost_per_token_above_100k_tokens: Option<f64>,
     pub input_cost_per_token_above_128k_tokens: Option<f64>,
     pub input_cost_per_token_above_200k_tokens: Option<f64>,
     pub input_cost_per_token_above_256k_tokens: Option<f64>,
     pub input_cost_per_token_above_272k_tokens: Option<f64>,
     pub output_cost_per_token: Option<f64>,
+    pub output_cost_per_token_above_100k_tokens: Option<f64>,
     pub output_cost_per_token_above_128k_tokens: Option<f64>,
     pub output_cost_per_token_above_200k_tokens: Option<f64>,
     pub output_cost_per_token_above_256k_tokens: Option<f64>,
     pub output_cost_per_token_above_272k_tokens: Option<f64>,
     pub cache_creation_input_token_cost: Option<f64>,
+    pub cache_creation_input_token_cost_above_100k_tokens: Option<f64>,
     pub cache_creation_input_token_cost_above_200k_tokens: Option<f64>,
+    pub cache_creation_input_token_cost_above_1hr: Option<f64>,
+    pub cache_creation_input_token_cost_above_1hr_above_100k_tokens: Option<f64>,
+    pub cache_creation_input_token_cost_above_1hr_above_200k_tokens: Option<f64>,
     pub cache_read_input_token_cost: Option<f64>,
+    pub cache_read_input_token_cost_above_100k_tokens: Option<f64>,
     pub cache_read_input_token_cost_above_200k_tokens: Option<f64>,
     pub cache_read_input_token_cost_above_272k_tokens: Option<f64>,
 }
@@ -35,39 +42,53 @@ impl ModelPricing {
     /// Leaving that to a comment is not safe enough for
     /// `quotes_zero_for_every_published_rate`, where an overlooked rate is
     /// treated as zero and a new paid tier would read as free.
-    pub(crate) fn all_rates(&self) -> [Option<f64>; 15] {
+    pub(crate) fn all_rates(&self) -> [Option<f64>; 22] {
         let Self {
             input_cost_per_token,
+            input_cost_per_token_above_100k_tokens,
             input_cost_per_token_above_128k_tokens,
             input_cost_per_token_above_200k_tokens,
             input_cost_per_token_above_256k_tokens,
             input_cost_per_token_above_272k_tokens,
             output_cost_per_token,
+            output_cost_per_token_above_100k_tokens,
             output_cost_per_token_above_128k_tokens,
             output_cost_per_token_above_200k_tokens,
             output_cost_per_token_above_256k_tokens,
             output_cost_per_token_above_272k_tokens,
             cache_creation_input_token_cost,
+            cache_creation_input_token_cost_above_100k_tokens,
             cache_creation_input_token_cost_above_200k_tokens,
+            cache_creation_input_token_cost_above_1hr,
+            cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens,
             cache_read_input_token_cost,
+            cache_read_input_token_cost_above_100k_tokens,
             cache_read_input_token_cost_above_200k_tokens,
             cache_read_input_token_cost_above_272k_tokens,
         } = *self;
 
         [
             input_cost_per_token,
+            input_cost_per_token_above_100k_tokens,
             input_cost_per_token_above_128k_tokens,
             input_cost_per_token_above_200k_tokens,
             input_cost_per_token_above_256k_tokens,
             input_cost_per_token_above_272k_tokens,
             output_cost_per_token,
+            output_cost_per_token_above_100k_tokens,
             output_cost_per_token_above_128k_tokens,
             output_cost_per_token_above_200k_tokens,
             output_cost_per_token_above_256k_tokens,
             output_cost_per_token_above_272k_tokens,
             cache_creation_input_token_cost,
+            cache_creation_input_token_cost_above_100k_tokens,
             cache_creation_input_token_cost_above_200k_tokens,
+            cache_creation_input_token_cost_above_1hr,
+            cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens,
             cache_read_input_token_cost,
+            cache_read_input_token_cost_above_100k_tokens,
             cache_read_input_token_cost_above_200k_tokens,
             cache_read_input_token_cost_above_272k_tokens,
         ]
@@ -149,10 +170,58 @@ impl ModelPricing {
 
         let valid_rate =
             |rate: Option<f64>| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0);
+        let cache_write_5m = usage.cache_write.saturating_sub(usage.cache_write_1h);
+        let has_5m_rate = valid_rate(self.cache_creation_input_token_cost);
+        let has_1h_rate = valid_rate(self.cache_creation_input_token_cost_above_1hr);
         (usage.input <= 0 || valid_rate(self.input_cost_per_token))
             && (usage.output <= 0 && usage.reasoning <= 0 || valid_rate(self.output_cost_per_token))
             && (usage.cache_read <= 0 || valid_rate(self.cache_read_input_token_cost))
-            && (usage.cache_write <= 0 || valid_rate(self.cache_creation_input_token_cost))
+            && (cache_write_5m <= 0 || has_5m_rate)
+            && (usage.cache_write_1h <= 0 || has_5m_rate || has_1h_rate)
+    }
+
+    pub(crate) fn uncovered_buckets(&self, usage: &crate::TokenBreakdown) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.quotes_zero_for_every_published_rate() {
+            return missing;
+        }
+
+        let valid_rate =
+            |rate: Option<f64>| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0);
+        let cache_write_5m = usage.cache_write.saturating_sub(usage.cache_write_1h);
+        let has_5m_rate = valid_rate(self.cache_creation_input_token_cost);
+        let has_1h_rate = valid_rate(self.cache_creation_input_token_cost_above_1hr);
+
+        if usage.input > 0 && !valid_rate(self.input_cost_per_token) {
+            missing.push("input");
+        }
+        if (usage.output > 0 || usage.reasoning > 0) && !valid_rate(self.output_cost_per_token) {
+            missing.push("output");
+        }
+        if usage.cache_read > 0 && !valid_rate(self.cache_read_input_token_cost) {
+            missing.push("cache_read");
+        }
+        if cache_write_5m > 0 && !has_5m_rate {
+            missing.push("cache_write");
+        }
+        if usage.cache_write_1h > 0 && !has_5m_rate && !has_1h_rate {
+            missing.push("cache_write_1h");
+        }
+
+        missing
+    }
+
+    /// Whether `usage` bills a 1-hour cache write that this row cannot price
+    /// at the 1-hour rate. `covers_usage` treats the 5-minute rate as enough,
+    /// so `resolve_for_usage` asks this separately before skipping the
+    /// canonical borrow.
+    pub(crate) fn lacks_1h_cache_write_rate_for(&self, usage: &crate::TokenBreakdown) -> bool {
+        if self.quotes_zero_for_every_published_rate() {
+            return false;
+        }
+        let valid_rate =
+            |rate: Option<f64>| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0);
+        usage.cache_write_1h > 0 && !valid_rate(self.cache_creation_input_token_cost_above_1hr)
     }
 
     /// A copy of this row with rates taken from `fallback` for the buckets
@@ -181,6 +250,10 @@ impl ModelPricing {
             && valid_rate(fallback.input_cost_per_token)
         {
             filled.input_cost_per_token = fallback.input_cost_per_token;
+            filled.input_cost_per_token_above_100k_tokens = valid_or_fallback(
+                filled.input_cost_per_token_above_100k_tokens,
+                fallback.input_cost_per_token_above_100k_tokens,
+            );
             filled.input_cost_per_token_above_128k_tokens = valid_or_fallback(
                 filled.input_cost_per_token_above_128k_tokens,
                 fallback.input_cost_per_token_above_128k_tokens,
@@ -204,6 +277,10 @@ impl ModelPricing {
             && valid_rate(fallback.output_cost_per_token)
         {
             filled.output_cost_per_token = fallback.output_cost_per_token;
+            filled.output_cost_per_token_above_100k_tokens = valid_or_fallback(
+                filled.output_cost_per_token_above_100k_tokens,
+                fallback.output_cost_per_token_above_100k_tokens,
+            );
             filled.output_cost_per_token_above_128k_tokens = valid_or_fallback(
                 filled.output_cost_per_token_above_128k_tokens,
                 fallback.output_cost_per_token_above_128k_tokens,
@@ -227,6 +304,10 @@ impl ModelPricing {
             && valid_rate(fallback.cache_read_input_token_cost)
         {
             filled.cache_read_input_token_cost = fallback.cache_read_input_token_cost;
+            filled.cache_read_input_token_cost_above_100k_tokens = valid_or_fallback(
+                filled.cache_read_input_token_cost_above_100k_tokens,
+                fallback.cache_read_input_token_cost_above_100k_tokens,
+            );
             filled.cache_read_input_token_cost_above_200k_tokens = valid_or_fallback(
                 filled.cache_read_input_token_cost_above_200k_tokens,
                 fallback.cache_read_input_token_cost_above_200k_tokens,
@@ -242,9 +323,29 @@ impl ModelPricing {
             && valid_rate(fallback.cache_creation_input_token_cost)
         {
             filled.cache_creation_input_token_cost = fallback.cache_creation_input_token_cost;
+            filled.cache_creation_input_token_cost_above_100k_tokens = valid_or_fallback(
+                filled.cache_creation_input_token_cost_above_100k_tokens,
+                fallback.cache_creation_input_token_cost_above_100k_tokens,
+            );
             filled.cache_creation_input_token_cost_above_200k_tokens = valid_or_fallback(
                 filled.cache_creation_input_token_cost_above_200k_tokens,
                 fallback.cache_creation_input_token_cost_above_200k_tokens,
+            );
+        }
+
+        if usage.cache_write_1h > 0
+            && !valid_rate(filled.cache_creation_input_token_cost_above_1hr)
+            && valid_rate(fallback.cache_creation_input_token_cost_above_1hr)
+        {
+            filled.cache_creation_input_token_cost_above_1hr =
+                fallback.cache_creation_input_token_cost_above_1hr;
+            filled.cache_creation_input_token_cost_above_1hr_above_100k_tokens = valid_or_fallback(
+                filled.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+                fallback.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+            );
+            filled.cache_creation_input_token_cost_above_1hr_above_200k_tokens = valid_or_fallback(
+                filled.cache_creation_input_token_cost_above_1hr_above_200k_tokens,
+                fallback.cache_creation_input_token_cost_above_1hr_above_200k_tokens,
             );
         }
 
@@ -256,6 +357,12 @@ impl ModelPricing {
             self.input_cost_per_token,
             self.output_cost_per_token,
             self.cache_creation_input_token_cost,
+            // A row whose only published rate is the plain 1-hour cache-write
+            // price can still price usage that is entirely 1-hour writes;
+            // dropping it here made the cached loader retain nothing and the
+            // usage priced as $0 (#1374 review). High-only tiers stay out:
+            // a row with no base of any kind is not a usable row.
+            self.cache_creation_input_token_cost_above_1hr,
             self.cache_read_input_token_cost,
         ]
         .into_iter()
@@ -276,6 +383,7 @@ mod pricing_row_tests {
             output: 0,
             cache_read: 10,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: 0,
         }
     }
@@ -365,6 +473,7 @@ mod pricing_row_tests {
             output: 500,
             cache_read: 2_000,
             cache_write: 300,
+            cache_write_1h: 0,
             reasoning: 200,
         }
     }
@@ -435,6 +544,7 @@ mod pricing_row_tests {
             output: 0,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: 0,
         }));
     }
@@ -468,11 +578,61 @@ mod pricing_row_tests {
             usage.output,
             usage.cache_read,
             usage.cache_write,
+            usage.cache_write_1h,
             usage.reasoning,
         );
 
         assert_eq!(cost, 0.0);
         assert!(cost.is_finite());
+    }
+
+    #[test]
+    fn a_row_with_only_a_1hr_cache_write_rate_covers_usage_that_is_entirely_1hr() {
+        let hourly_only = ModelPricing {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(1e-5),
+            cache_creation_input_token_cost_above_1hr: Some(2e-5),
+            ..Default::default()
+        };
+        let usage = TokenBreakdown {
+            cache_write: 100_000,
+            cache_write_1h: 100_000,
+            ..Default::default()
+        };
+
+        assert!(hourly_only.covers_usage(&usage));
+
+        let cost = crate::pricing::lookup::compute_cost(
+            &hourly_only,
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+            usage.cache_write_1h,
+            usage.reasoning,
+        );
+        assert!((cost - (100_000.0 * 2e-5)).abs() < 1e-9, "cost was {cost}");
+    }
+
+    #[test]
+    fn a_row_with_only_a_1hr_cache_write_rate_has_a_usable_base_rate() {
+        // Retention (`has_any_usable_base_rate`) discarded such rows, so a
+        // cached catalog where a model publishes only the 1-hour cache-write
+        // price priced its entirely-hourly usage as $0 (#1374 review).
+        let hourly_only = ModelPricing {
+            cache_creation_input_token_cost_above_1hr: Some(6e-6),
+            ..Default::default()
+        };
+        assert!(hourly_only.has_any_usable_base_rate());
+
+        // High tiers alone are still not a usable base: without any base the
+        // first 200k tokens of a bucket would read as free.
+        let high_only = ModelPricing {
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens: Some(12e-6),
+            ..Default::default()
+        };
+        assert!(!high_only.has_any_usable_base_rate());
+        assert!(!ModelPricing::default().has_any_usable_base_rate());
     }
 
     // A bucket the usage does not touch is never filled.
@@ -502,6 +662,10 @@ pub fn load_cached_any_age() -> Option<PricingDataset> {
     cache::load_cache_any_age(CACHE_FILENAME)
 }
 
+pub(super) async fn fetch_uncached() -> Result<PricingDataset, String> {
+    fetch_inner(PRICING_URL, false).await
+}
+
 pub async fn fetch() -> Result<PricingDataset, String> {
     fetch_inner(PRICING_URL, true).await
 }
@@ -521,8 +685,8 @@ pub async fn fetch() -> Result<PricingDataset, String> {
 /// opt-out total and local — the caller that declined the cache cannot write to
 /// it by construction. The override still earns its keep in the regression
 /// test, where it is the only way to observe the write without touching the
-/// developer's real cache. No production caller wants read-bypass-with-write:
-/// `fetch()` is the sole one and it passes `true`.
+/// developer's real cache. The explicit refresh command also disables both here, then persists successful
+/// datasets separately so cache write failures are reported to the caller.
 async fn fetch_inner(url: &str, use_disk_cache: bool) -> Result<PricingDataset, String> {
     if use_disk_cache {
         if let Some(cached) = load_cached() {
@@ -715,6 +879,43 @@ mod tests {
             described.contains("not-a-number"),
             "describe_error must surface the serde cause naming the bad value, got: {}",
             described
+        );
+    }
+
+    #[test]
+    fn test_deserialize_model_pricing_with_above_100k_fields() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.0000001,
+                "input_cost_per_token_above_100k_tokens": 0.0000005,
+                "output_cost_per_token": 0.0000005,
+                "output_cost_per_token_above_100k_tokens": 0.0000025,
+                "cache_creation_input_token_cost": 0.000000125,
+                "cache_creation_input_token_cost_above_100k_tokens": 0.000000625,
+                "cache_creation_input_token_cost_above_1hr": 0.0000002,
+                "cache_creation_input_token_cost_above_1hr_above_100k_tokens": 0.000001,
+                "cache_read_input_token_cost": 0.00000001,
+                "cache_read_input_token_cost_above_100k_tokens": 0.00000005
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(pricing.input_cost_per_token_above_100k_tokens, Some(5e-7));
+        assert_eq!(
+            pricing.output_cost_per_token_above_100k_tokens,
+            Some(2.5e-6)
+        );
+        assert_eq!(
+            pricing.cache_creation_input_token_cost_above_100k_tokens,
+            Some(6.25e-7)
+        );
+        assert_eq!(
+            pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+            Some(1e-6)
+        );
+        assert_eq!(
+            pricing.cache_read_input_token_cost_above_100k_tokens,
+            Some(5e-8)
         );
     }
 

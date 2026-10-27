@@ -9,10 +9,26 @@ use std::sync::{Mutex, OnceLock};
 // normal log line. Diagnostics routed through this module are held until the
 // TUI releases the terminal, then written once the normal screen is restored.
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
-static DEFERRED_STDERR: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static DEFERRED_STDERR: OnceLock<Mutex<DeferredStderr>> = OnceLock::new();
 
-fn deferred_stderr() -> &'static Mutex<Vec<String>> {
-    DEFERRED_STDERR.get_or_init(|| Mutex::new(Vec::new()))
+#[derive(Default)]
+struct DeferredStderr {
+    messages: Vec<String>,
+    codex_scan_warnings: Vec<String>,
+    dsh_scan_warnings: Vec<String>,
+}
+
+impl DeferredStderr {
+    fn take(&mut self) -> Vec<String> {
+        let mut messages = std::mem::take(&mut self.messages);
+        messages.append(&mut self.codex_scan_warnings);
+        messages.append(&mut self.dsh_scan_warnings);
+        messages
+    }
+}
+
+fn deferred_stderr() -> &'static Mutex<DeferredStderr> {
+    DEFERRED_STDERR.get_or_init(|| Mutex::new(DeferredStderr::default()))
 }
 
 fn transition_tui_active(active: bool) -> Vec<String> {
@@ -27,7 +43,7 @@ fn transition_tui_active(active: bool) -> Vec<String> {
     if active {
         Vec::new()
     } else {
-        std::mem::take(&mut *deferred)
+        deferred.take()
     }
 }
 
@@ -46,7 +62,7 @@ fn route_stderr(message: String) -> Option<String> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if is_tui_active() {
-        deferred.push(message);
+        deferred.messages.push(message);
         None
     } else {
         Some(message)
@@ -59,12 +75,45 @@ pub(crate) fn emit_or_defer_stderr(message: String) {
     }
 }
 
+// Source diagnostics describe the latest scan. Keep them separate
+// from event diagnostics so refreshes replace the complete set and a resolved
+// scan clears it.
+fn route_scan_warnings(
+    messages: Vec<String>,
+    slot: fn(&mut DeferredStderr) -> &mut Vec<String>,
+) -> Vec<String> {
+    let mut deferred = deferred_stderr().lock().unwrap_or_else(|p| p.into_inner());
+    if is_tui_active() {
+        *slot(&mut deferred) = messages;
+        Vec::new()
+    } else {
+        slot(&mut deferred).clear();
+        messages
+    }
+}
+
+fn route_codex_scan_warnings(messages: Vec<String>) -> Vec<String> {
+    route_scan_warnings(messages, |state| &mut state.codex_scan_warnings)
+}
+
+pub(crate) fn update_dsh_scan_warnings(messages: Vec<String>) {
+    for message in route_scan_warnings(messages, |state| &mut state.dsh_scan_warnings) {
+        eprintln!("{message}");
+    }
+}
+
+pub(crate) fn update_codex_scan_warnings(messages: Vec<String>) {
+    for message in route_codex_scan_warnings(messages) {
+        eprintln!("{message}");
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn take_deferred_stderr_for_test() -> Vec<String> {
     let mut deferred = deferred_stderr()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    std::mem::take(&mut *deferred)
+    deferred.take()
 }
 
 /// Sets `TUI_ACTIVE` for the duration of a test and restores the previous
@@ -125,6 +174,24 @@ mod tests {
 
     #[test]
     #[serial]
+    fn dsh_refresh_replaces_its_warning_without_erasing_codex_diagnostics() {
+        let mut restore = TuiActiveGuard::capture();
+        let _ = transition_tui_active(false);
+        restore.set(true);
+        update_codex_scan_warnings(vec!["codex warning".to_string()]);
+        update_dsh_scan_warnings(vec!["old DSH warning".to_string()]);
+        update_dsh_scan_warnings(vec!["new DSH warning".to_string()]);
+        assert_eq!(
+            take_deferred_stderr_for_test(),
+            ["codex warning", "new DSH warning"]
+        );
+        update_dsh_scan_warnings(vec!["resolved DSH warning".to_string()]);
+        update_dsh_scan_warnings(Vec::new());
+        assert!(take_deferred_stderr_for_test().is_empty());
+    }
+
+    #[test]
+    #[serial]
     fn defers_stderr_until_the_tui_is_inactive() {
         let _restore = TuiActiveGuard::capture();
 
@@ -145,6 +212,49 @@ mod tests {
             route_stderr("immediate diagnostic".to_string()),
             Some("immediate diagnostic".to_string())
         );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_scan_warnings_keep_only_the_latest_scan_and_preserve_event_diagnostics() {
+        let _restore = TuiActiveGuard::capture();
+        let _discarded = transition_tui_active(false);
+        assert!(transition_tui_active(true).is_empty());
+        assert!(route_stderr("first cache error".to_string()).is_none());
+        for _ in 0..100 {
+            assert!(route_codex_scan_warnings(vec![
+                "old source count".to_string(),
+                "old archive count".to_string(),
+            ])
+            .is_empty());
+        }
+        assert!(route_stderr("second cache error".to_string()).is_none());
+        assert!(route_codex_scan_warnings(vec![
+            "latest source count".to_string(),
+            "latest archive count".to_string(),
+        ])
+        .is_empty());
+        assert_eq!(
+            transition_tui_active(false),
+            vec![
+                "first cache error",
+                "second cache error",
+                "latest source count",
+                "latest archive count",
+            ]
+        );
+        assert_eq!(
+            route_codex_scan_warnings(vec!["immediate warning".to_string()]),
+            vec!["immediate warning".to_string()]
+        );
+        assert!(route_codex_scan_warnings(Vec::new()).is_empty());
+
+        assert!(transition_tui_active(true).is_empty());
+        assert!(route_stderr("unrelated cache error".to_string()).is_none());
+        assert!(route_codex_scan_warnings(vec!["resolved source warning".to_string()]).is_empty());
+        assert!(route_codex_scan_warnings(Vec::new()).is_empty());
+        assert_eq!(transition_tui_active(false), vec!["unrelated cache error"]);
+        assert!(transition_tui_active(false).is_empty());
     }
 
     /// The guard's whole reason to exist, mirroring

@@ -2,16 +2,79 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::widgets::{
-    ambient_stable_scrollbar, format_cost, format_tokens, get_client_color,
-    get_client_display_name, viewport_scrollbar_state, AMBIENT_STABLE_BORDER_SET,
+    format_cost, format_tokens, get_client_color, period_source_display_name,
+    viewport_scrollbar_state,
 };
 use crate::tui::app::{App, ClickAction};
+use crate::tui::data::find_peak_hour;
+use crate::tui::i18n::{tr, MessageKey, TuiLanguage};
+use crate::ui_glyphs::ChartFill;
 
 const CELL_WIDTH: u16 = 2;
-const MONTH_LABELS: &[&str] = &[
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-const DAY_LABELS: &[&str] = &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+fn day_labels(lang: TuiLanguage) -> &'static [&'static str] {
+    match lang {
+        TuiLanguage::En => &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
+        TuiLanguage::Ko => &["일", "월", "화", "수", "목", "금", "토"],
+        TuiLanguage::Ja => &["日", "月", "火", "水", "木", "金", "土"],
+        TuiLanguage::ZhCn => &["日", "一", "二", "三", "四", "五", "六"],
+        TuiLanguage::Fr => &["dim", "lun", "mar", "mer", "jeu", "ven", "sam"],
+    }
+}
+
+fn month_labels(lang: TuiLanguage) -> &'static [&'static str] {
+    match lang {
+        TuiLanguage::En => &[
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ],
+        TuiLanguage::Ko => &[
+            "1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월", "9월", "10월", "11월", "12월",
+        ],
+        TuiLanguage::Ja => &[
+            "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月",
+        ],
+        TuiLanguage::ZhCn => &[
+            "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月",
+        ],
+        TuiLanguage::Fr => &[
+            "jan", "fév", "mar", "avr", "mai", "jui", "jul", "aoû", "sep", "oct", "nov", "déc",
+        ],
+    }
+}
+
+fn contribution_cell(app: &App, color: Color, selected: bool, empty: bool) -> (String, Style) {
+    match app.glyphs.chart_fill {
+        ChartFill::Foreground => {
+            if selected {
+                (
+                    app.glyphs.heat_selected.to_string(),
+                    app.theme.graph_cell_selected_style(color),
+                )
+            } else if empty {
+                (
+                    app.glyphs.heat_empty.to_string(),
+                    app.theme.subtle_text_style(),
+                )
+            } else {
+                (app.glyphs.heat_cell.to_string(), Style::default().fg(color))
+            }
+        }
+        ChartFill::Background => {
+            if selected {
+                (
+                    app.glyphs.heat_selected.to_string(),
+                    app.theme.graph_cell_selected_style(color),
+                )
+            } else if empty {
+                (
+                    app.glyphs.heat_empty.to_string(),
+                    app.theme.subtle_text_style(),
+                )
+            } else {
+                (app.glyphs.heat_cell.to_string(), Style::default().bg(color))
+            }
+        }
+    }
+}
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let has_selected_cell = app.selected_graph_cell.is_some();
@@ -66,16 +129,16 @@ fn render_graph(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme_background = app.theme.background;
     let theme_muted = app.theme.muted;
     let theme_colors = app.theme.colors;
-    let subtle_text_style = app.theme.subtle_text_style();
     let selected_cell = app.selected_graph_cell;
     let is_narrow = app.is_narrow();
 
+    let lang = app.settings.tui_language;
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_set(AMBIENT_STABLE_BORDER_SET)
+        .border_set(app.glyphs.border)
         .border_style(Style::default().fg(theme_border))
         .title(Span::styled(
-            " Contribution Graph (52 weeks) ",
+            tr(lang, MessageKey::TitleContributionGraph),
             Style::default()
                 .fg(theme_accent)
                 .add_modifier(Modifier::BOLD),
@@ -94,7 +157,8 @@ fn render_graph(frame: &mut Frame, app: &mut App, area: Rect) {
     let graph_start_x = inner.x + label_width;
     let graph_start_y = inner.y + 2;
 
-    for (day_idx, label) in DAY_LABELS.iter().enumerate() {
+    let day_labels = day_labels(lang);
+    for (day_idx, label) in day_labels.iter().enumerate() {
         if day_idx % 2 == 1 {
             let y = graph_start_y + day_idx as u16;
             if y < inner.y + inner.height {
@@ -143,19 +207,9 @@ fn render_graph(frame: &mut Frame, app: &mut App, area: Rect) {
             let (cell_str, style) = match day_opt {
                 Some(day) => {
                     let color = intensity_color(day.intensity);
-                    if is_selected {
-                        ("▓▓", app.theme.graph_cell_selected_style(color))
-                    } else {
-                        ("██", Style::default().fg(color))
-                    }
+                    contribution_cell(app, color, is_selected, false)
                 }
-                None => {
-                    if is_selected {
-                        ("▓▓", app.theme.graph_cell_selected_style(theme_colors[0]))
-                    } else {
-                        ("· ", subtle_text_style)
-                    }
-                }
+                None => contribution_cell(app, theme_colors[0], is_selected, true),
             };
 
             let cell = Paragraph::new(cell_str).style(style);
@@ -171,6 +225,7 @@ fn render_graph(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let month_y = inner.y;
     let mut current_month: Option<usize> = None;
+    let month_labels = month_labels(lang);
 
     for (week_idx, week) in graph.weeks.iter().skip(start_week).enumerate() {
         if let Some(Some(day)) = week.first() {
@@ -184,10 +239,14 @@ fn render_graph(frame: &mut Frame, app: &mut App, area: Rect) {
             if current_month != Some(month) {
                 current_month = Some(month);
                 let x = graph_start_x + (week_idx as u16 * CELL_WIDTH);
-                if x + 3 < inner.x + inner.width && month < MONTH_LABELS.len() {
-                    let label =
-                        Paragraph::new(MONTH_LABELS[month]).style(Style::default().fg(theme_muted));
-                    frame.render_widget(label, Rect::new(x, month_y, 3, 1));
+                if month < month_labels.len() {
+                    let label_text = month_labels[month];
+                    let label_w = unicode_width::UnicodeWidthStr::width(label_text) as u16;
+                    if x + label_w <= inner.x + inner.width {
+                        let label =
+                            Paragraph::new(label_text).style(Style::default().fg(theme_muted));
+                        frame.render_widget(label, Rect::new(x, month_y, label_w, 1));
+                    }
                 }
             }
         }
@@ -195,12 +254,13 @@ fn render_graph(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let lang = app.settings.tui_language;
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_set(AMBIENT_STABLE_BORDER_SET)
+        .border_set(app.glyphs.border)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
-            " Stats ",
+            format!(" {} ", tr(lang, MessageKey::TabStats)),
             Style::default()
                 .fg(app.theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -278,6 +338,9 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
         .map(|m| app.model_color_for(&m.provider, &m.color_key))
         .unwrap_or_else(|| app.model_color("N/A"));
     let sessions: u32 = app.data.models.iter().map(|m| m.session_count).sum();
+    let peak_hour = find_peak_hour(&app.data.hourly)
+        .map(|(hour, _, _)| format!("{:02}:00", hour))
+        .unwrap_or_else(|| "N/A".to_string());
 
     let col1_width = if is_narrow { 36u16 } else { 60u16 };
     let col2_x = inner.x + col1_width;
@@ -286,24 +349,28 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     let mut y = inner.y;
 
     let row1_label = if is_narrow {
-        "Model:"
+        tr(lang, MessageKey::StatsFavoriteModelShort)
     } else {
-        "Favorite model:"
+        tr(lang, MessageKey::StatsFavoriteModel)
     };
     let row1 = Line::from(vec![
         Span::styled(row1_label, Style::default().fg(app.theme.muted)),
         Span::raw(" "),
         Span::styled(
-            truncate_model_name(favorite_model_name, if is_narrow { 15 } else { 30 }),
+            truncate_model_name(
+                favorite_model_name,
+                if is_narrow { 15 } else { 30 },
+                app.glyphs.ellipsis,
+            ),
             Style::default().fg(model_color),
         ),
     ]);
     frame.render_widget(Paragraph::new(row1), Rect::new(inner.x, y, col1_width, 1));
 
     let tokens_label = if is_narrow {
-        "Tokens:"
+        tr(lang, MessageKey::StatsTokensShort)
     } else {
-        "Total tokens:"
+        tr(lang, MessageKey::StatsTotalTokens)
     };
     let row1_col2 = Line::from(vec![
         Span::styled(tokens_label, Style::default().fg(app.theme.muted)),
@@ -321,13 +388,20 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let row2 = Line::from(vec![
-        Span::styled("Sessions:", Style::default().fg(app.theme.muted)),
+        Span::styled(
+            tr(lang, MessageKey::StatsSessions),
+            Style::default().fg(app.theme.muted),
+        ),
         Span::raw(" "),
         Span::styled(sessions.to_string(), app.theme.count_style()),
     ]);
     frame.render_widget(Paragraph::new(row2), Rect::new(inner.x, y, col1_width, 1));
 
-    let cost_label = if is_narrow { "Cost:" } else { "Total cost:" };
+    let cost_label = if is_narrow {
+        tr(lang, MessageKey::StatsCostShort)
+    } else {
+        tr(lang, MessageKey::StatsTotalCost)
+    };
     let row2_col2 = Line::from(vec![
         Span::styled(cost_label, Style::default().fg(app.theme.muted)),
         Span::raw(" "),
@@ -345,30 +419,45 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     // Row 3: Current streak / Longest streak
     let streak_label = if is_narrow {
-        "Streak:"
+        tr(lang, MessageKey::StatsStreakShort)
     } else {
-        "Current streak:"
+        tr(lang, MessageKey::StatsCurrentStreak)
+    };
+    let format_streak = |streak: u32| -> String {
+        let day_key = if streak == 1 {
+            MessageKey::CountDay
+        } else {
+            MessageKey::CountDays
+        };
+        match lang {
+            TuiLanguage::Ko | TuiLanguage::Ja | TuiLanguage::ZhCn => {
+                format!("{}{}", streak, tr(lang, day_key))
+            }
+            TuiLanguage::En | TuiLanguage::Fr => {
+                format!("{} {}", streak, tr(lang, day_key))
+            }
+        }
     };
     let row3 = Line::from(vec![
         Span::styled(streak_label, Style::default().fg(app.theme.muted)),
         Span::raw(" "),
         Span::styled(
-            format!("{} days", app.data.current_streak),
+            format_streak(app.data.current_streak),
             app.theme.count_style(),
         ),
     ]);
     frame.render_widget(Paragraph::new(row3), Rect::new(inner.x, y, col1_width, 1));
 
     let longest_label = if is_narrow {
-        "Max streak:"
+        tr(lang, MessageKey::StatsLongestStreakShort)
     } else {
-        "Longest streak:"
+        tr(lang, MessageKey::StatsLongestStreak)
     };
     let row3_col2 = Line::from(vec![
         Span::styled(longest_label, Style::default().fg(app.theme.muted)),
         Span::raw(" "),
         Span::styled(
-            format!("{} days", app.data.longest_streak),
+            format_streak(app.data.longest_streak),
             app.theme.count_style(),
         ),
     ]);
@@ -382,7 +471,11 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let active_label = if is_narrow { "Active:" } else { "Active days:" };
+    let active_label = if is_narrow {
+        tr(lang, MessageKey::StatsActiveShort)
+    } else {
+        tr(lang, MessageKey::StatsActiveDays)
+    };
     let active_days_line = Line::from(vec![
         Span::styled(active_label, Style::default().fg(app.theme.muted)),
         Span::raw(" "),
@@ -396,22 +489,58 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
         Rect::new(inner.x, y, col1_width, 1),
     );
 
+    let peak_label = if is_narrow {
+        tr(lang, MessageKey::StatsPeakHourShort)
+    } else {
+        tr(lang, MessageKey::StatsPeakHour)
+    };
+    let peak_hour_line = Line::from(vec![
+        Span::styled(peak_label, Style::default().fg(app.theme.muted)),
+        Span::raw(" "),
+        Span::styled(peak_hour, app.theme.count_style()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(peak_hour_line),
+        Rect::new(col2_x, y, inner.width.saturating_sub(col1_width), 1),
+    );
+
     y += 2;
     if y >= y_max {
         return;
     }
 
     let legend_spans = vec![
-        Span::styled("Less ", Style::default().fg(app.theme.muted)),
-        Span::styled("· ", app.theme.subtle_text_style()),
-        Span::styled("██", Style::default().fg(app.theme.colors[1])),
+        Span::styled(
+            format!("{} ", tr(lang, MessageKey::StatsLess)),
+            Style::default().fg(app.theme.muted),
+        ),
+        {
+            let (text, style) = contribution_cell(app, app.theme.colors[0], false, true);
+            Span::styled(text, style)
+        },
+        {
+            let (text, style) = contribution_cell(app, app.theme.colors[1], false, false);
+            Span::styled(text, style)
+        },
         Span::raw(" "),
-        Span::styled("██", Style::default().fg(app.theme.colors[2])),
+        {
+            let (text, style) = contribution_cell(app, app.theme.colors[2], false, false);
+            Span::styled(text, style)
+        },
         Span::raw(" "),
-        Span::styled("██", Style::default().fg(app.theme.colors[3])),
+        {
+            let (text, style) = contribution_cell(app, app.theme.colors[3], false, false);
+            Span::styled(text, style)
+        },
         Span::raw(" "),
-        Span::styled("██", Style::default().fg(app.theme.colors[4])),
-        Span::styled(" More", Style::default().fg(app.theme.muted)),
+        {
+            let (text, style) = contribution_cell(app, app.theme.colors[4], false, false);
+            Span::styled(text, style)
+        },
+        Span::styled(
+            format!(" {}", tr(lang, MessageKey::StatsMore)),
+            Style::default().fg(app.theme.muted),
+        ),
     ];
     let legend_line = Line::from(legend_spans);
     frame.render_widget(
@@ -425,11 +554,26 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     if !is_narrow {
-        let footer = Line::from(Span::styled(
-            format!(
+        let footer_text = match lang {
+            TuiLanguage::Ko => {
+                format!("AI 코딩 어시스턴트에 총 ${:.2}를 지출했습니다!", total_cost)
+            }
+            TuiLanguage::Ja => format!(
+                "AIコーディングアシスタントに合計${:.2}を使用しました！",
+                total_cost
+            ),
+            TuiLanguage::ZhCn => format!("您在AI编程助手上共花费了 ${:.2}！", total_cost),
+            TuiLanguage::Fr => format!(
+                "Votre dépense totale pour les assistants IA est de ${:.2} !",
+                total_cost
+            ),
+            TuiLanguage::En => format!(
                 "Your total spending is ${:.2} on AI coding assistants!",
                 total_cost
             ),
+        };
+        let footer = Line::from(Span::styled(
+            footer_text,
             Style::default()
                 .fg(app.theme.hint_key_color())
                 .add_modifier(Modifier::ITALIC),
@@ -441,13 +585,64 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn format_localized_date(date: chrono::NaiveDate, lang: TuiLanguage) -> String {
+    use chrono::Datelike;
+    let year = date.year();
+    let month = date.month() as usize;
+    let day = date.day();
+    let weekday = date.weekday();
+
+    match lang {
+        TuiLanguage::En => {
+            let months = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            let weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+            let w_idx = weekday.num_days_from_monday() as usize;
+            let m_str = months.get(month.saturating_sub(1)).unwrap_or(&"Jan");
+            let w_str = weekdays.get(w_idx).unwrap_or(&"Mon");
+            format!("{}, {} {:02}, {}", w_str, m_str, day, year)
+        }
+        TuiLanguage::Ko => {
+            let weekdays = ["월", "화", "수", "목", "금", "토", "일"];
+            let w_idx = weekday.num_days_from_monday() as usize;
+            let w_str = weekdays.get(w_idx).unwrap_or(&"월");
+            format!("{}년 {}월 {}일 ({})", year, month, day, w_str)
+        }
+        TuiLanguage::Ja => {
+            let weekdays = ["月", "火", "水", "木", "金", "土", "日"];
+            let w_idx = weekday.num_days_from_monday() as usize;
+            let w_str = weekdays.get(w_idx).unwrap_or(&"月");
+            format!("{}年{}月{}日 ({})", year, month, day, w_str)
+        }
+        TuiLanguage::ZhCn => {
+            let weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+            let w_idx = weekday.num_days_from_monday() as usize;
+            let w_str = weekdays.get(w_idx).unwrap_or(&"周一");
+            format!("{}年{}月{}日 {}", year, month, day, w_str)
+        }
+        TuiLanguage::Fr => {
+            let months = [
+                "janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.",
+                "nov.", "déc.",
+            ];
+            let weekdays = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."];
+            let w_idx = weekday.num_days_from_monday() as usize;
+            let m_str = months.get(month.saturating_sub(1)).unwrap_or(&"janv.");
+            let w_str = weekdays.get(w_idx).unwrap_or(&"lun.");
+            format!("{} {} {} {}", w_str, day, m_str, year)
+        }
+    }
+}
+
 fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+    let lang = app.settings.tui_language;
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_set(AMBIENT_STABLE_BORDER_SET)
+        .border_set(app.glyphs.border)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
-            " Day Breakdown (ESC to close) ",
+            tr(lang, MessageKey::TitleDayBreakdown),
             Style::default()
                 .fg(app.theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -479,7 +674,7 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         Some(d) => d,
         None => {
             app.stats_breakdown_total_lines = 0;
-            let no_data = Paragraph::new("No data for this day")
+            let no_data = Paragraph::new(tr(lang, MessageKey::EmptyNoDataForDay))
                 .style(Style::default().fg(app.theme.muted))
                 .alignment(Alignment::Center);
             frame.render_widget(no_data, inner);
@@ -492,7 +687,7 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
-                day.date.format("%a, %b %d, %Y").to_string(),
+                format_localized_date(day.date, lang),
                 Style::default()
                     .fg(app.theme.foreground)
                     .add_modifier(Modifier::BOLD),
@@ -513,10 +708,11 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(daily) = daily_usage {
         if daily.source_breakdown.is_empty() {
             lines.push(Line::from(Span::styled(
-                "No detailed breakdown available",
+                tr(lang, MessageKey::EmptyNoBreakdownAvailable),
                 Style::default().fg(app.theme.muted),
             )));
         } else {
+            let group_by = app.group_by.borrow().clone();
             for (client, source_info) in &daily.source_breakdown {
                 let mut models: Vec<_> = source_info.models.values().collect();
                 models.sort_by(|a, b| {
@@ -527,13 +723,13 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                 });
 
                 let client_color = app.theme.color(get_client_color(client));
-                let client_name = get_client_display_name(client);
+                let client_name = period_source_display_name(&group_by, client);
                 let model_count = models.len();
                 let plural = if model_count > 1 { "s" } else { "" };
 
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("● {}", client_name),
+                        format!("{} {}", app.glyphs.legend_dot, client_name),
                         Style::default()
                             .fg(client_color)
                             .add_modifier(Modifier::BOLD),
@@ -556,9 +752,16 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                         app.model_color_for(&model_info.provider, &model_info.color_key);
                     lines.push(Line::from(vec![
                         Span::raw("  "),
-                        Span::styled("●", Style::default().fg(model_color)),
+                        Span::styled(app.glyphs.legend_dot, Style::default().fg(model_color)),
                         Span::styled(
-                            format!(" {}", truncate_model_name(&model_info.display_name, 25)),
+                            format!(
+                                " {}",
+                                truncate_model_name(
+                                    &model_info.display_name,
+                                    25,
+                                    app.glyphs.ellipsis
+                                )
+                            ),
                             Style::default().fg(app.theme.foreground),
                         ),
                     ]));
@@ -598,17 +801,26 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                                 format_tokens(model_info.tokens.input),
                                 secondary_text_style,
                             ),
-                            Span::styled(" · Out: ", subtle_text_style),
+                            Span::styled(
+                                format!(" {} Out: ", app.glyphs.compact_separator),
+                                subtle_text_style,
+                            ),
                             Span::styled(
                                 format_tokens(model_info.tokens.output),
                                 secondary_text_style,
                             ),
-                            Span::styled(" · CR: ", subtle_text_style),
+                            Span::styled(
+                                format!(" {} CR: ", app.glyphs.compact_separator),
+                                subtle_text_style,
+                            ),
                             Span::styled(
                                 format_tokens(model_info.tokens.cache_read),
                                 secondary_text_style,
                             ),
-                            Span::styled(" · CW: ", subtle_text_style),
+                            Span::styled(
+                                format!(" {} CW: ", app.glyphs.compact_separator),
+                                subtle_text_style,
+                            ),
                             Span::styled(
                                 format_tokens(model_info.tokens.cache_write),
                                 secondary_text_style,
@@ -620,7 +832,7 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     } else {
         lines.push(Line::from(Span::styled(
-            "No detailed breakdown available",
+            tr(lang, MessageKey::EmptyNoBreakdownAvailable),
             Style::default().fg(app.theme.muted),
         )));
     }
@@ -642,7 +854,7 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(paragraph, inner);
 
     if app.stats_breakdown_total_lines > visible_height {
-        let scrollbar = ambient_stable_scrollbar();
+        let scrollbar = app.glyphs.scrollbar();
 
         let mut scrollbar_state = viewport_scrollbar_state(
             app.stats_breakdown_total_lines,
@@ -661,7 +873,7 @@ fn render_breakdown_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn truncate_model_name(s: &str, max_chars: usize) -> String {
+fn truncate_model_name(s: &str, max_chars: usize, marker: &str) -> String {
     if max_chars == 0 {
         return String::new();
     }
@@ -669,10 +881,10 @@ fn truncate_model_name(s: &str, max_chars: usize) -> String {
     if char_count <= max_chars {
         s.to_string()
     } else if max_chars == 1 {
-        "…".to_string()
+        marker.to_string()
     } else {
         let head: String = s.chars().take(max_chars - 1).collect();
-        format!("{}…", head)
+        format!("{head}{marker}")
     }
 }
 
@@ -696,7 +908,9 @@ mod tests {
             initial_tab: None,
             ..Default::default()
         };
-        App::new_with_cached_data(config, None).unwrap()
+        let mut app = App::new_with_cached_data(config, None).unwrap();
+        app.settings.tui_language = TuiLanguage::En;
+        app
     }
 
     fn corrupt_day(date: NaiveDate) -> ContributionDay {
@@ -736,5 +950,82 @@ mod tests {
             .map(|c| c.symbol().to_string())
             .collect::<String>();
         assert!(!body.trim().is_empty());
+        assert!(body.contains("Peak hour: N/A"), "{body}");
+    }
+
+    #[test]
+    fn stats_panel_shows_peak_hour() {
+        use crate::tui::data::{HourlyUsage, TokenBreakdown};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut app = make_app();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 29).unwrap();
+        let hour = |h: u32, tokens: u64| HourlyUsage {
+            datetime: date.and_hms_opt(h, 0, 0).unwrap(),
+            tokens: TokenBreakdown {
+                input: tokens,
+                ..TokenBreakdown::default()
+            },
+            cost: 1.0,
+            clients: BTreeSet::new(),
+            models: BTreeMap::new(),
+            message_count: 1,
+            turn_count: 1,
+        };
+        app.data.hourly = vec![hour(9, 10), hour(14, 500), hour(21, 40)];
+
+        let backend = TestBackend::new(100, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_stats_panel(frame, &app, Rect::new(0, 0, 100, 16)))
+            .unwrap();
+
+        let body = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect::<String>();
+        assert!(body.contains("Peak hour: 14:00"), "{body}");
+    }
+
+    #[test]
+    fn format_localized_date_supports_all_languages() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(); // Thursday
+        assert_eq!(
+            format_localized_date(date, TuiLanguage::En),
+            "Thu, Sep 24, 2026"
+        );
+        assert_eq!(
+            format_localized_date(date, TuiLanguage::Ko),
+            "2026년 9월 24일 (목)"
+        );
+        assert_eq!(
+            format_localized_date(date, TuiLanguage::Ja),
+            "2026年9月24日 (木)"
+        );
+        assert_eq!(
+            format_localized_date(date, TuiLanguage::ZhCn),
+            "2026年9月24日 周四"
+        );
+        assert_eq!(
+            format_localized_date(date, TuiLanguage::Fr),
+            "jeu. 24 sept. 2026"
+        );
+    }
+
+    #[test]
+    fn day_and_month_labels_have_twelve_and_seven_items() {
+        for lang in [
+            TuiLanguage::En,
+            TuiLanguage::Ko,
+            TuiLanguage::Ja,
+            TuiLanguage::ZhCn,
+            TuiLanguage::Fr,
+        ] {
+            assert_eq!(day_labels(lang).len(), 7);
+            assert_eq!(month_labels(lang).len(), 12);
+        }
     }
 }

@@ -17,7 +17,7 @@
 //! opposite of the point.
 
 use super::utils::{
-    open_readonly_sqlite_opt, sqlite_for_each_row_on, sqlite_for_each_row_on_with_params,
+    open_readonly_sqlite_snapshot, sqlite_for_each_row_on, sqlite_for_each_row_on_with_params,
     SqliteScan,
 };
 use super::{
@@ -607,12 +607,36 @@ const MICODE_QUERY_GROUPS: &[&[&str]] = &[MICODE_QUERIES];
 /// The `json_valid` guard is load-bearing here and deliberately absent from the
 /// other clients: without it a single malformed `data` blob makes SQLite's
 /// `json_extract` abort the whole statement rather than skip the row.
+///
+/// Kilo CLI imports the Kilo Code VS Code extension's task history into this
+/// database as `ses_migrated_*` sessions whose assistant turns are stamped
+/// `providerID`/`modelID` `"legacy"` with all-zero tokens and cost
+/// (`kilo-vscode/src/legacy-migration/sessions/lib/messages.ts` writes exactly
+/// that shape). Those rows carry no usage, and the same turns are already
+/// counted (with real tokens and model) by the `kilocode` task-log parser, so
+/// they are skipped rather than reported as a zero-token "legacy" model.
+///
+/// Every part of that shape is required, not just the two ids: a row that
+/// merely spells its provider and model `legacy` while carrying real usage is
+/// somebody's actual spend and must survive. The `_` in the session prefix is
+/// escaped because it is a SQLite `LIKE` wildcard.
 const KILO_QUERIES: &[&str] = &[r#"
         SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM message m
         WHERE json_valid(m.data)
           AND json_extract(m.data, '$.role') = 'assistant'
           AND json_extract(m.data, '$.tokens') IS NOT NULL
+          AND NOT (
+            json_extract(m.data, '$.providerID') IS 'legacy'
+            AND json_extract(m.data, '$.modelID') IS 'legacy'
+            AND m.session_id LIKE 'ses_migrated\_%' ESCAPE '\'
+            AND IFNULL(json_extract(m.data, '$.cost'), 0) = 0
+            AND IFNULL(json_extract(m.data, '$.tokens.input'), 0) = 0
+            AND IFNULL(json_extract(m.data, '$.tokens.output'), 0) = 0
+            AND IFNULL(json_extract(m.data, '$.tokens.reasoning'), 0) = 0
+            AND IFNULL(json_extract(m.data, '$.tokens.cache.read'), 0) = 0
+            AND IFNULL(json_extract(m.data, '$.tokens.cache.write'), 0) = 0
+          )
     "#];
 
 const KILO_QUERY_GROUPS: &[&[&str]] = &[KILO_QUERIES];
@@ -732,6 +756,7 @@ pub(crate) fn reported_cost(cost: Option<f64>) -> Option<f64> {
 /// channel-suffixed sibling database, or an overlap between schema generations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OpenCodeSchemaFingerprint {
+    billing_provider: Option<String>,
     created_bits: u64,
     completed_bits: Option<u64>,
     model_id: String,
@@ -743,6 +768,11 @@ struct OpenCodeSchemaFingerprint {
     cache_write: i64,
     cost_bits: u64,
     agent: Option<String>,
+    /// Surface/client tag for stores that host more than one product surface
+    /// (e.g. MiMo Code CLI vs Xiaomi MiMo AI desktop sharing one SQLite file).
+    /// `None` keeps legacy fingerprint equality so clients that do not split
+    /// surfaces still collapse fork copies.
+    surface: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -767,9 +797,20 @@ struct OpenCodeSchemaRow {
     eligible: bool,
 }
 
+/// Exact row identity captured by the same decode that produces a message.
+/// Kept outside UnifiedMessage because only the shared-store MiMo reducer
+/// needs fractional timestamps and embedded-id provenance across cache hits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenCodeRowMetadata {
+    pub created_bits: u64,
+    pub completed_bits: Option<u64>,
+    pub has_embedded_id: bool,
+}
+
 #[derive(Default)]
 struct SchemaAccumulator {
     messages: Vec<UnifiedMessage>,
+    raw_metadata: Option<Vec<OpenCodeRowMetadata>>,
     fingerprint_indices: HashMap<OpenCodeSchemaFingerprint, Vec<usize>>,
     dedup_states: Vec<SchemaDedupState>,
     /// Dedup keys of every row that took part in a fingerprint merge, on both
@@ -794,6 +835,7 @@ impl SchemaAccumulator {
         row: OpenCodeSchemaRow,
         cfg: &OpenCodeSchemaConfig,
         db_namespace: &str,
+        session_clients: Option<&std::collections::HashMap<String, String>>,
     ) -> Option<usize> {
         let OpenCodeSchemaRow {
             row_id,
@@ -808,6 +850,10 @@ impl SchemaAccumulator {
             return None;
         }
 
+        #[cfg(test)]
+        if cfg.client == super::micode::MICODE_CLIENT_ID {
+            super::micode::io_tests::record_decode();
+        }
         let mut bytes = data_json.into_bytes();
         let msg: OpenCodeSchemaMessage = match simd_json::from_slice(&mut bytes) {
             Ok(m) => m,
@@ -836,6 +882,11 @@ impl SchemaAccumulator {
         };
         let model_id = resolved_model_id?;
 
+        let billing_provider = if cfg.dual_schema {
+            msg.resolve_provider_id()
+        } else {
+            msg.provider_id.clone()
+        };
         let provider_id = resolve_provider(&msg, &model_id, cfg);
 
         // A payload with no `$.time` is dropped unless the client supplies a
@@ -874,6 +925,23 @@ impl SchemaAccumulator {
             row_session_id
         };
 
+        // Classify surface *before* fingerprint merge. A store that hosts both
+        // MiMo Code CLI and Xiaomi MiMo AI desktop can otherwise collapse two
+        // distinct turns that share usage stats, keeping only the first row's
+        // surface label and hiding the other surface's tokens from its filter.
+        let (stamped_client, surface) = match session_clients {
+            Some(map) => {
+                let client = map
+                    .get(&session_id)
+                    .map(String::as_str)
+                    .unwrap_or(cfg.client)
+                    .to_string();
+                let surface = client.clone();
+                (client, Some(surface))
+            }
+            None => (cfg.client.to_string(), None),
+        };
+
         let message_id = msg.id.clone();
         let dedup_key = match message_id.clone() {
             // Embedded ids are globally unique: keep them un-namespaced so the
@@ -886,7 +954,7 @@ impl SchemaAccumulator {
         };
 
         let mut unified = UnifiedMessage::new_with_agent(
-            cfg.client,
+            stamped_client,
             model_id.clone(),
             provider_id.clone(),
             session_id,
@@ -896,10 +964,15 @@ impl SchemaAccumulator {
                 output,
                 cache_read,
                 cache_write,
+                cache_write_1h: 0,
                 reasoning,
             },
             cost,
             agent.clone(),
+        )
+        .with_billing(
+            billing_provider.as_deref(),
+            super::BillingIdentityOrigin::ExplicitRecord,
         );
         if cfg.record_duration {
             unified.duration_ms = duration_ms(created_ms, completed_ms);
@@ -939,6 +1012,13 @@ impl SchemaAccumulator {
 
         if cfg.dedup == DedupMode::Off {
             let index = self.messages.len();
+            if let Some(metadata) = &mut self.raw_metadata {
+                metadata.push(OpenCodeRowMetadata {
+                    created_bits: created_ms.to_bits(),
+                    completed_bits: completed_ms.map(f64::to_bits),
+                    has_embedded_id: message_id.is_some(),
+                });
+            }
             self.messages.push(unified);
             return Some(index);
         }
@@ -948,6 +1028,9 @@ impl SchemaAccumulator {
             completed_bits: completed_ms.map(f64::to_bits),
             model_id,
             provider_id,
+            billing_provider: billing_provider
+                .as_deref()
+                .and_then(super::normalize_billing_provider),
             input,
             output,
             reasoning,
@@ -955,6 +1038,7 @@ impl SchemaAccumulator {
             cache_write,
             cost_bits: cost.to_bits(),
             agent,
+            surface,
         };
 
         // Cloning the small index list avoids holding a borrow of
@@ -1193,7 +1277,56 @@ pub(crate) fn parse_opencode_schema_sqlite(
     db_path: &Path,
     cfg: OpenCodeSchemaConfig,
 ) -> Vec<UnifiedMessage> {
-    scan_opencode_schema_sqlite(db_path, cfg).messages
+    parse_opencode_schema_sqlite_with_session_clients(db_path, cfg, None)
+}
+
+/// Like [`parse_opencode_schema_sqlite`], but stamps each message with the
+/// client id registered for its session (falling back to `cfg.client`) and
+/// keeps fingerprint merges surface-aware.
+pub(crate) fn parse_opencode_schema_sqlite_with_session_clients(
+    db_path: &Path,
+    cfg: OpenCodeSchemaConfig,
+    session_clients: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<UnifiedMessage> {
+    scan_opencode_schema_sqlite_with_session_clients(db_path, cfg, session_clients).messages
+}
+
+/// Parse physical rows using a caller-owned connection and return exact
+/// provenance alongside each accepted message. No row is decoded twice and
+/// no fingerprint merge can discard aliases before shared-store accounting.
+pub(crate) fn parse_opencode_schema_rows_on(
+    db_path: &Path,
+    conn: &rusqlite::Connection,
+    mut cfg: OpenCodeSchemaConfig,
+    session_clients: &HashMap<String, String>,
+) -> (Vec<UnifiedMessage>, Vec<OpenCodeRowMetadata>, bool) {
+    cfg.dedup = DedupMode::Off;
+    let namespace = if cfg.namespace_rowid_dedup_key {
+        db_path.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+    let mut acc = SchemaAccumulator {
+        raw_metadata: Some(Vec::new()),
+        ..Default::default()
+    };
+    let mut complete = true;
+    for group in cfg.query_groups {
+        for query in *group {
+            let scan = collect_rows(db_path, conn, query, &mut |row| {
+                acc.ingest(row, &cfg, &namespace, Some(session_clients));
+            });
+            if scan.prepared() {
+                #[cfg(test)]
+                if cfg.client == super::micode::MICODE_CLIENT_ID {
+                    super::micode::io_tests::record_scan();
+                }
+                complete &= scan.completed();
+                break;
+            }
+        }
+    }
+    (acc.messages, acc.raw_metadata.unwrap_or_default(), complete)
 }
 
 // =============================================================================
@@ -1292,8 +1425,37 @@ const MAX_MERGED_DEDUP_KEYS: usize = 250_000;
 pub(crate) static INCREMENTAL_RESCANS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Runs once between OpenCode query groups for a matching database path.
+#[cfg(test)]
+type PathScopedQueryGroupHook = Option<(std::path::PathBuf, fn(&Path))>;
+
+#[cfg(test)]
+static BETWEEN_OPENCODE_QUERY_GROUPS_HOOK: std::sync::Mutex<PathScopedQueryGroupHook> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_between_opencode_query_groups_hook(path: &Path) {
+    let hook = {
+        let mut slot = BETWEEN_OPENCODE_QUERY_GROUPS_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|(expected_path, _)| expected_path == path)
+        {
+            slot.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
 /// A scan's messages plus the state a later scan needs to resume from it.
 pub(crate) struct OpenCodeSchemaScan {
+    pub complete: bool,
     pub messages: Vec<UnifiedMessage>,
     /// `None` for a client with no incremental support, and for a database
     /// that could not be opened.
@@ -1304,6 +1466,7 @@ impl OpenCodeSchemaScan {
     fn empty() -> Self {
         Self {
             messages: Vec::new(),
+            complete: false,
             incremental: None,
         }
     }
@@ -1351,7 +1514,15 @@ pub(crate) fn scan_opencode_schema_sqlite(
     db_path: &Path,
     cfg: OpenCodeSchemaConfig,
 ) -> OpenCodeSchemaScan {
-    let Some(conn) = open_readonly_sqlite_opt(db_path) else {
+    scan_opencode_schema_sqlite_with_session_clients(db_path, cfg, None)
+}
+
+pub(crate) fn scan_opencode_schema_sqlite_with_session_clients(
+    db_path: &Path,
+    cfg: OpenCodeSchemaConfig,
+    session_clients: Option<&std::collections::HashMap<String, String>>,
+) -> OpenCodeSchemaScan {
+    let Some(conn) = open_readonly_sqlite_snapshot(db_path) else {
         return OpenCodeSchemaScan::empty();
     };
 
@@ -1369,6 +1540,8 @@ pub(crate) fn scan_opencode_schema_sqlite(
     // incrementally, and a mark that silently skipped it would serve those rows
     // stale forever. One such group disqualifies the whole database.
     let mut resumable = true;
+    let mut complete = true;
+    let mut matched_group = false;
 
     for (group_index, group) in cfg.query_groups.iter().enumerate() {
         let incremental = cfg
@@ -1389,7 +1562,7 @@ pub(crate) fn scan_opencode_schema_sqlite(
         for (index, query) in group.iter().enumerate() {
             let scan = collect_rows(db_path, &conn, query, &mut |row| {
                 let row_id = row.row_id.clone();
-                if let Some(message_index) = acc.ingest(row, &cfg, &db_namespace) {
+                if let Some(message_index) = acc.ingest(row, &cfg, &db_namespace, session_clients) {
                     group_parsed_rows.push((row_id, message_index));
                 }
             });
@@ -1399,7 +1572,9 @@ pub(crate) fn scan_opencode_schema_sqlite(
                 break;
             }
         }
+        matched_group |= chosen.is_some();
         if chosen.is_some() && !read_every_row {
+            complete = false;
             resumable = false;
         }
         parsed_rows.push(group_parsed_rows);
@@ -1436,6 +1611,11 @@ pub(crate) fn scan_opencode_schema_sqlite(
             }
             _ => None,
         });
+
+        #[cfg(test)]
+        if group_index + 1 < cfg.query_groups.len() {
+            run_between_opencode_query_groups_hook(db_path);
+        }
     }
 
     // Resolve each physical row to the final message slot after all
@@ -1486,6 +1666,7 @@ pub(crate) fn scan_opencode_schema_sqlite(
     let merged_dedup_keys = acc.merged_dedup_keys.into_iter().collect();
 
     OpenCodeSchemaScan {
+        complete: complete && matched_group,
         messages: acc.messages,
         incremental: cfg.incremental_groups.filter(|_| resumable).map(|_| {
             OpenCodeIncrementalState {
@@ -1511,14 +1692,30 @@ pub(crate) fn rescan_opencode_schema_sqlite(
     db_path: &Path,
     cfg: OpenCodeSchemaConfig,
     cached_state: &OpenCodeIncrementalState,
+    cached_messages: Vec<UnifiedMessage>,
+) -> Option<OpenCodeSchemaScan> {
+    rescan_opencode_schema_sqlite_with_session_clients(
+        db_path,
+        cfg,
+        cached_state,
+        cached_messages,
+        None,
+    )
+}
+
+pub(crate) fn rescan_opencode_schema_sqlite_with_session_clients(
+    db_path: &Path,
+    cfg: OpenCodeSchemaConfig,
+    cached_state: &OpenCodeIncrementalState,
     mut cached_messages: Vec<UnifiedMessage>,
+    session_clients: Option<&std::collections::HashMap<String, String>>,
 ) -> Option<OpenCodeSchemaScan> {
     let incremental_groups = cfg.incremental_groups?;
     if cached_state.groups.len() != cfg.query_groups.len() {
         return None;
     }
 
-    let conn = open_readonly_sqlite_opt(db_path)?;
+    let conn = open_readonly_sqlite_snapshot(db_path)?;
     let db_namespace = if cfg.namespace_rowid_dedup_key {
         db_path.to_string_lossy().into_owned()
     } else {
@@ -1640,7 +1837,7 @@ pub(crate) fn rescan_opencode_schema_sqlite(
                 return;
             };
             seen_changed.insert(row.row_id.clone());
-            if let Some(message_slot) = acc.ingest(row, &cfg, &db_namespace) {
+            if let Some(message_slot) = acc.ingest(row, &cfg, &db_namespace, session_clients) {
                 group_parsed_slots.push((row_slot, message_slot));
             }
         }) {
@@ -1758,6 +1955,7 @@ pub(crate) fn rescan_opencode_schema_sqlite(
     #[cfg(test)]
     INCREMENTAL_RESCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(OpenCodeSchemaScan {
+        complete: true,
         messages,
         incremental: Some(OpenCodeIncrementalState {
             groups: marks,
@@ -1865,4 +2063,118 @@ fn merge_incremental_messages(
     }
 
     Some(merged)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    struct BetweenQueryGroupsHook;
+
+    impl BetweenQueryGroupsHook {
+        fn set(path: &Path, hook: fn(&Path)) -> Self {
+            *BETWEEN_OPENCODE_QUERY_GROUPS_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((path.to_path_buf(), hook));
+            Self
+        }
+    }
+
+    impl Drop for BetweenQueryGroupsHook {
+        fn drop(&mut self) {
+            *BETWEEN_OPENCODE_QUERY_GROUPS_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    fn payload(output: i64) -> String {
+        format!(
+            r#"{{
+                "id": "logical-turn",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4",
+                "providerID": "anthropic",
+                "tokens": {{ "input": 10, "output": {output}, "reasoning": 0, "cache": {{ "read": 0, "write": 0 }} }},
+                "time": {{ "created": 1700000000000.0 }}
+            }}"#
+        )
+    }
+
+    fn migrate_turn_to_v1(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        let transaction = conn.unchecked_transaction().unwrap();
+        transaction
+            .execute("DELETE FROM session_message WHERE id = 'logical-turn'", [])
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES ('logical-turn', 'session-1', 2000, 2000, ?1)",
+                [payload(150)],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn full_scan_reads_dual_schema_groups_from_one_snapshot() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 type TEXT NOT NULL,
+                 time_created INTEGER NOT NULL,
+                 time_updated INTEGER NOT NULL,
+                 data TEXT NOT NULL
+             );
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 time_created INTEGER NOT NULL,
+                 time_updated INTEGER NOT NULL,
+                 data TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message
+                 (id, session_id, type, time_created, time_updated, data)
+             VALUES ('logical-turn', 'session-1', 'assistant', 1000, 1000, ?1)",
+            params![payload(100)],
+        )
+        .unwrap();
+
+        let hook = BetweenQueryGroupsHook::set(&db_path, migrate_turn_to_v1);
+        let scan = scan_opencode_schema_sqlite(&db_path, OpenCodeSchemaConfig::opencode());
+        drop(hook);
+
+        assert!(scan.complete);
+        assert_eq!(
+            scan.messages
+                .iter()
+                .map(|message| message.tokens.output)
+                .sum::<i64>(),
+            100,
+            "the v2 and v1 query groups must share the pre-write snapshot"
+        );
+        let post_write = scan_opencode_schema_sqlite(&db_path, OpenCodeSchemaConfig::opencode());
+        assert_eq!(
+            post_write
+                .messages
+                .iter()
+                .map(|message| message.tokens.output)
+                .sum::<i64>(),
+            150,
+            "the test writer must commit the replacement turn"
+        );
+    }
 }

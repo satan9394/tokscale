@@ -150,10 +150,13 @@ mod tests {
             client: "claude".to_string(),
             workspace_key: None,
             workspace_label: None,
+            machine: None,
             tokens: TokenBreakdown::default(),
             cost,
             performance: Default::default(),
             session_count: 1,
+            group_key: String::new(),
+            daily: Vec::new(),
         }
     }
 

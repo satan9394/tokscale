@@ -3,10 +3,11 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::bar_chart::{render_stacked_bar_chart, ModelSegment, StackedBarData};
 use super::widgets::{
-    ambient_stable_scrollbar, fit_workspace_label_to_width, format_tokens, truncate_to_width,
-    viewport_scrollbar_state, AMBIENT_STABLE_BORDER_SET,
+    display_width, fit_workspace_label_to_width_with_marker, format_tokens,
+    truncate_ellipsis_to_width_with_marker, truncate_to_width, viewport_scrollbar_state,
 };
 use crate::tui::app::{App, ChartGranularity};
+use crate::tui::i18n::{tr, MessageKey};
 use tokscale_core::GroupBy;
 
 struct ModelRowData {
@@ -14,6 +15,7 @@ struct ModelRowData {
     color_key: String,
     provider: String,
     workspace_label: Option<String>,
+    machine: Option<String>,
     tokens_input: u64,
     tokens_output: u64,
     tokens_cache_read: u64,
@@ -21,16 +23,50 @@ struct ModelRowData {
     cost: f64,
 }
 
-fn overview_model_label(group_by: &GroupBy, model: &str, workspace_label: Option<&str>) -> String {
-    if *group_by == GroupBy::WorkspaceModel {
-        format!(
+fn overview_model_label(
+    group_by: &GroupBy,
+    model: &str,
+    workspace_label: Option<&str>,
+    machine: Option<&str>,
+) -> String {
+    match group_by {
+        GroupBy::WorkspaceModel => format!(
             "{} / {}",
             workspace_label.unwrap_or("Unknown workspace"),
             model
-        )
-    } else {
-        model.to_string()
+        ),
+        GroupBy::MachineModel => format!(
+            "{} / {}",
+            machine.unwrap_or(tokscale_core::machine_label::DEFAULT_LOCAL_MACHINE_LABEL),
+            model
+        ),
+        _ => model.to_string(),
     }
+}
+
+/// Fit a `machine / model` label into `max_cells`, keeping the model whole
+/// and cutting the machine. When not even one machine cell and the marker fit
+/// beside the model, the model leads and is head-cut, so the row still names
+/// what it counts.
+fn fit_machine_model_label(
+    label: &str,
+    machine: &str,
+    model: &str,
+    max_cells: usize,
+    marker: &str,
+) -> String {
+    if display_width(label) <= max_cells {
+        return label.to_string();
+    }
+    let suffix = format!(" / {model}");
+    let machine_cells = max_cells.saturating_sub(display_width(&suffix));
+    if machine_cells > display_width(marker) {
+        return format!(
+            "{}{suffix}",
+            truncate_ellipsis_to_width_with_marker(machine, machine_cells, marker)
+        );
+    }
+    truncate_ellipsis_to_width_with_marker(model, max_cells, marker)
 }
 
 fn overview_color_key<'a>(group_by: &GroupBy, model: &'a str) -> &'a str {
@@ -157,7 +193,12 @@ fn render_legend(frame: &mut Frame, app: &App, area: Rect) {
         .take(legend_limit)
         .map(|m| {
             (
-                overview_model_label(&group_by, &m.model, m.workspace_label.as_deref()),
+                overview_model_label(
+                    &group_by,
+                    &m.model,
+                    m.workspace_label.as_deref(),
+                    m.machine.as_deref(),
+                ),
                 app.model_color_for(&m.provider, &m.color_key),
             )
         })
@@ -169,13 +210,20 @@ fn render_legend(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut spans: Vec<Span> = Vec::new();
     for (i, (model_name, color)) in top_models.iter().enumerate() {
-        let name = truncate_string(model_name, max_name_width);
+        let name =
+            truncate_ellipsis_to_width_with_marker(model_name, max_name_width, app.glyphs.ellipsis);
 
-        spans.push(Span::styled("●", Style::default().fg(*color)));
+        spans.push(Span::styled(
+            app.glyphs.legend_dot,
+            Style::default().fg(*color),
+        ));
         spans.push(Span::raw(format!(" {}", name)));
 
         if i < top_models.len() - 1 {
-            spans.push(Span::styled("  ·", Style::default().fg(muted_color)));
+            spans.push(Span::styled(
+                format!("  {}", app.glyphs.compact_separator),
+                Style::default().fg(muted_color),
+            ));
         }
     }
 
@@ -212,6 +260,7 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
             color_key: m.color_key.clone(),
             provider: m.provider.clone(),
             workspace_label: m.workspace_label.clone(),
+            machine: m.machine.clone(),
             tokens_input: m.tokens.input,
             tokens_output: m.tokens.output,
             tokens_cache_read: m.tokens.cache_read,
@@ -220,24 +269,29 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
         })
         .collect();
 
+    let lang = app.settings.tui_language;
     let title = if is_very_narrow {
-        "Top Models".to_string()
+        tr(lang, MessageKey::OverviewTopModels).to_string()
     } else {
         match sort_field {
-            SortField::Tokens => "Models by Tokens".to_string(),
-            _ => "Models by Cost".to_string(),
+            SortField::Tokens => tr(lang, MessageKey::OverviewModelsByTokens).to_string(),
+            _ => tr(lang, MessageKey::OverviewModelsByCost).to_string(),
         }
     };
 
     let title_right = if is_very_narrow {
         format_cost(total_cost)
     } else {
-        format!("Total: {}", format_cost(total_cost))
+        format!(
+            "{}{}",
+            tr(lang, MessageKey::OverviewTotal),
+            format_cost(total_cost)
+        )
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_set(AMBIENT_STABLE_BORDER_SET)
+        .border_set(app.glyphs.border)
         .border_style(Style::default().fg(theme_border))
         .title(Span::styled(
             format!(" {} ", title),
@@ -258,7 +312,7 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
     frame.render_widget(block, area);
 
     if models_data.is_empty() {
-        let empty = Paragraph::new("No data available")
+        let empty = Paragraph::new(tr(lang, MessageKey::EmptyNoDataAvailable))
             .style(Style::default().fg(theme_muted))
             .alignment(Alignment::Center);
         frame.render_widget(empty, inner);
@@ -279,7 +333,7 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
     // panel is full-width here, so spend it rather than clipping to a constant.
     let max_name_width = if is_narrow {
         20
-    } else if group_by == GroupBy::WorkspaceModel {
+    } else if matches!(group_by, GroupBy::WorkspaceModel | GroupBy::MachineModel) {
         // Leave room for the "● " marker and the trailing " (12.3%)".
         inner.width.saturating_sub(12).max(35) as usize
     } else {
@@ -305,8 +359,12 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
         };
 
         let model_color = app.model_color_for(&model.provider, &model.color_key);
-        let display_name =
-            overview_model_label(&group_by, &model.model, model.workspace_label.as_deref());
+        let display_name = overview_model_label(
+            &group_by,
+            &model.model,
+            model.workspace_label.as_deref(),
+            model.machine.as_deref(),
+        );
         // Measured in cells, not code points: `max_name_width` is derived from
         // `inner.width`, and a workspace path can hold full-width graphemes (a CJK
         // directory name), which a char count calls short at twice the cells it
@@ -315,7 +373,25 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
             // `workspace / model` is identified by both ends, so a head cut on a
             // narrow panel leaves the shared path prefix and drops the model
             // entirely. Same reasoning as the Workspace column in the table.
-            fit_workspace_label_to_width(&display_name, max_name_width)
+            fit_workspace_label_to_width_with_marker(
+                &display_name,
+                max_name_width,
+                app.glyphs.ellipsis,
+            )
+        } else if group_by == GroupBy::MachineModel {
+            // `machine / model` is read by its model: a head cut keeps the
+            // machine and drops the model, so every model on one machine
+            // rendered as the same row. The machine part gives way instead.
+            fit_machine_model_label(
+                &display_name,
+                model
+                    .machine
+                    .as_deref()
+                    .unwrap_or(tokscale_core::machine_label::DEFAULT_LOCAL_MACHINE_LABEL),
+                &model.model,
+                max_name_width,
+                app.glyphs.ellipsis,
+            )
         } else {
             truncate_to_width(&display_name, max_name_width)
         };
@@ -329,7 +405,7 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
         frame.render_widget(Paragraph::new("").style(row_style), line1_area);
 
         let line1_spans = vec![
-            Span::styled("●", Style::default().fg(model_color)),
+            Span::styled(app.glyphs.legend_dot, Style::default().fg(model_color)),
             Span::styled(
                 format!(" {}", name),
                 Style::default()
@@ -375,11 +451,20 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
             vec![
                 Span::styled("  In: ", subtle_text_style),
                 Span::styled(format_tokens(model.tokens_input), secondary_text_style),
-                Span::styled(" · Out: ", subtle_text_style),
+                Span::styled(
+                    format!(" {} Out: ", app.glyphs.compact_separator),
+                    subtle_text_style,
+                ),
                 Span::styled(format_tokens(model.tokens_output), secondary_text_style),
-                Span::styled(" · CR: ", subtle_text_style),
+                Span::styled(
+                    format!(" {} CR: ", app.glyphs.compact_separator),
+                    subtle_text_style,
+                ),
                 Span::styled(format_tokens(model.tokens_cache_read), secondary_text_style),
-                Span::styled(" · CW: ", subtle_text_style),
+                Span::styled(
+                    format!(" {} CW: ", app.glyphs.compact_separator),
+                    subtle_text_style,
+                ),
                 Span::styled(
                     format_tokens(model.tokens_cache_write),
                     secondary_text_style,
@@ -395,7 +480,7 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
     }
 
     if models_len > items_per_page {
-        let scrollbar = ambient_stable_scrollbar();
+        let scrollbar = app.glyphs.scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(models_len, scroll_offset, items_per_page);
@@ -411,17 +496,105 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
     }
 }
 
-fn truncate_string(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use super::*;
+    use crate::tui::data::ModelUsage;
+    use crate::tui::{Tab, TuiConfig};
+
+    const MODEL: &str = "claude-sonnet-4-5-20250929";
+
+    fn machine_row(machine: &str) -> ModelUsage {
+        ModelUsage {
+            model: MODEL.to_string(),
+            color_key: MODEL.to_string(),
+            provider: "anthropic".to_string(),
+            client: "claude".to_string(),
+            workspace_key: None,
+            workspace_label: None,
+            machine: Some(machine.to_string()),
+            tokens: Default::default(),
+            cost: 1.0,
+            performance: Default::default(),
+            session_count: 1,
+            group_key: format!("{machine}:{MODEL}"),
+            daily: Vec::new(),
+        }
     }
-    let char_count = s.chars().count();
-    if char_count <= max_chars {
-        s.to_string()
-    } else if max_chars == 1 {
-        "…".to_string()
-    } else {
-        let head: String = s.chars().take(max_chars - 1).collect();
-        format!("{}…", head)
+
+    /// Render the Overview tab under `machine,model` and return its rows.
+    fn render_overview_rows(machine: &str, width: u16) -> Vec<String> {
+        let mut app = App::new_with_cached_data(TuiConfig::default(), None).unwrap();
+        app.current_tab = Tab::Overview;
+        *app.group_by.borrow_mut() = GroupBy::MachineModel;
+        app.data.models = vec![machine_row(machine)];
+        app.terminal_width = width;
+        app.terminal_height = 40;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+        terminal
+            .draw(|frame| super::render(frame, &mut app, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// A long machine label must not push the model id off the row. Head
+    /// truncation at a fixed 35 cells kept only the machine, so every model
+    /// on that machine rendered as the same `machine...` row.
+    #[test]
+    fn top_models_keeps_the_model_id_whole_after_a_long_machine_label() {
+        let machine = "steven-macbook-pro-2024-studio-mirror";
+        let rows = render_overview_rows(machine, 120);
+        let label = format!("{machine} / {MODEL}");
+        assert!(
+            rows.iter().any(|row| row.contains(&label)),
+            "the full `machine / model` label must fit a 120-cell Overview:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// When the label is wider than the row, the machine part gives way and
+    /// the model id stays whole.
+    #[test]
+    fn top_models_truncates_the_machine_not_the_model() {
+        let machine = "steven-macbook-pro-2024-studio-mirror-with-a-very-long-hostname-suffix";
+        let rows = render_overview_rows(machine, 90);
+        let row = rows
+            .iter()
+            .find(|row| row.contains(&format!(" / {MODEL}")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the model id must stay whole after the machine:\n{}",
+                    rows.join("\n")
+                )
+            });
+        assert!(row.contains("steven-macbook"), "{row}");
+        assert!(!row.contains(machine), "{row}");
+        assert!(row.contains("(100.0%)"), "{row}");
+    }
+
+    #[test]
+    fn fit_machine_model_label_prefers_the_model() {
+        let label = |machine: &str, cells: usize| {
+            fit_machine_model_label(&format!("{machine} / {MODEL}"), machine, MODEL, cells, "~")
+        };
+        // Fits: unchanged.
+        assert_eq!(label("blade", 60), format!("blade / {MODEL}"));
+        // Too wide: only the machine is cut.
+        let fitted = label("steven-macbook-pro", 40);
+        assert_eq!(fitted, format!("steven-mac~ / {MODEL}"));
+        assert_eq!(display_width(&fitted), 40);
+        // No room for any machine text: the model still leads the cut.
+        let fitted = label("steven-macbook-pro", 20);
+        assert_eq!(display_width(&fitted), 20);
+        assert!(fitted.starts_with("claude-sonnet"), "{fitted}");
     }
 }

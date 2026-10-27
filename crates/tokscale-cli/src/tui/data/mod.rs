@@ -7,8 +7,9 @@ use tokio::runtime::{Handle, Runtime};
 
 use tokscale_core::sessions::UnifiedMessage;
 use tokscale_core::{
-    model_name_for_grouping, normalize_model_for_grouping, parse_local_unified_messages, sessions,
-    ClientId, GroupBy, LocalParseOptions, ModelPerformance, WorktreeRollup,
+    model_name_for_grouping, normalize_model_for_grouping, parse_local_unified_messages,
+    parse_local_unified_messages_deferred, sessions, ClientId, GroupBy, LocalParseOptions,
+    ModelPerformance, PendingSourceCacheSave, WorktreeRollup,
 };
 
 /// Returns the scanner settings that `DataLoader` should use when building
@@ -53,10 +54,29 @@ pub struct ModelUsage {
     pub client: String,
     pub workspace_key: Option<String>,
     pub workspace_label: Option<String>,
+    /// Machine label of the row; set only for `GroupBy::MachineModel`.
+    pub machine: Option<String>,
     pub tokens: TokenBreakdown,
     pub cost: f64,
     pub performance: ModelPerformance,
     pub session_count: u32,
+    /// The aggregation key this row was grouped under. Unlike the display
+    /// fields it is unique per row under every `GroupBy`, including the
+    /// session groupings, so it can identify a row across refreshes.
+    pub group_key: String,
+    /// This row's usage split by day, oldest first. Recomputed on every load
+    /// and not round-tripped through the TUI cache, like sessions.
+    pub daily: Vec<ModelDayUsage>,
+}
+
+/// One day of one Models-tab row, for the per-model daily trend view.
+#[derive(Debug, Clone)]
+pub struct ModelDayUsage {
+    pub date: NaiveDate,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub messages: u64,
+    pub performance: ModelPerformance,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +103,9 @@ pub struct DailyModelInfo {
     pub tokens: TokenBreakdown,
     pub cost: f64,
     pub messages: u64,
+    /// Generation speed for this model on this day, accumulated the same way
+    /// as [`ModelUsage::performance`] so the two views agree.
+    pub performance: ModelPerformance,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +120,7 @@ pub struct DailyUsage {
     pub date: NaiveDate,
     pub tokens: TokenBreakdown,
     pub cost: f64,
+    /// Keyed by client, or by machine label for `GroupBy::MachineModel`.
     pub source_breakdown: BTreeMap<String, DailySourceInfo>,
     pub message_count: u32,
     pub turn_count: u32,
@@ -116,6 +140,7 @@ pub struct HourlyUsage {
     pub datetime: NaiveDateTime,
     pub tokens: TokenBreakdown,
     pub cost: f64,
+    /// Clients seen, or machine labels for `GroupBy::MachineModel`.
     pub clients: BTreeSet<String>,
     pub models: BTreeMap<String, HourlyModelInfo>,
     pub message_count: u32,
@@ -127,6 +152,7 @@ pub struct MinutelyUsage {
     pub datetime: NaiveDateTime,
     pub tokens: TokenBreakdown,
     pub cost: f64,
+    /// Clients seen, or machine labels for `GroupBy::MachineModel`.
     pub clients: BTreeSet<String>,
     pub models: BTreeMap<String, HourlyModelInfo>,
     pub message_count: u32,
@@ -153,6 +179,12 @@ pub struct SessionUsage {
     /// (e.g. OpenCode's `session.title` column). `None` for clients that
     /// don't record a title.
     pub title: Option<String>,
+    /// Canonical workspace / project directory path where the session ran.
+    pub workspace_key: Option<String>,
+    /// Friendly workspace / project name when available.
+    pub workspace_label: Option<String>,
+    /// Distinct agent roles observed in this session in first-seen order.
+    pub agents: Vec<String>,
     /// Distinct models used across messages in this session, in first-seen
     /// order. Most sessions use a single model; a few switch mid-conversation.
     pub models: Vec<SessionModel>,
@@ -166,6 +198,190 @@ pub struct SessionUsage {
     /// Unix-ms timestamp of the most recent message observed in this session.
     /// `0` when every message lacked a usable timestamp.
     pub last_active_ms: i64,
+    /// Number of subagent sessions rolled into this entry. Only nonzero in
+    /// `UsageData::sessions_rolled`; the flat `sessions` view leaves it 0.
+    pub subagent_count: u32,
+}
+
+impl SessionUsage {
+    pub(crate) fn new(client: &str, session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            client: client.to_string(),
+            title: None,
+            workspace_key: None,
+            workspace_label: None,
+            agents: Vec::new(),
+            models: Vec::new(),
+            tokens: TokenBreakdown::default(),
+            cost: 0.0,
+            message_count: 0,
+            turn_count: 0,
+            first_active_ms: 0,
+            last_active_ms: 0,
+            subagent_count: 0,
+        }
+    }
+
+    /// Merge a rolled-up subagent branch into this root entry: usage sums,
+    /// the activity window extends across both, and this entry's own title
+    /// (the root session's) takes precedence over the branch's. Used to fold
+    /// sub-sub-agent chains into the root session. `subagent_count` is
+    /// assigned from the merged child sets afterwards, not here.
+    fn merge_subagent_branch(&mut self, branch: &SessionUsage) {
+        self.tokens.input = self.tokens.input.saturating_add(branch.tokens.input);
+        self.tokens.output = self.tokens.output.saturating_add(branch.tokens.output);
+        self.tokens.cache_read = self
+            .tokens
+            .cache_read
+            .saturating_add(branch.tokens.cache_read);
+        self.tokens.cache_write = self
+            .tokens
+            .cache_write
+            .saturating_add(branch.tokens.cache_write);
+        self.tokens.reasoning = self
+            .tokens
+            .reasoning
+            .saturating_add(branch.tokens.reasoning);
+        self.cost += branch.cost;
+        self.message_count = self.message_count.saturating_add(branch.message_count);
+        self.turn_count = self.turn_count.saturating_add(branch.turn_count);
+        if branch.first_active_ms != 0
+            && (self.first_active_ms == 0 || branch.first_active_ms < self.first_active_ms)
+        {
+            self.first_active_ms = branch.first_active_ms;
+        }
+        self.last_active_ms = self.last_active_ms.max(branch.last_active_ms);
+        if self.title.is_none() {
+            self.title = branch.title.clone();
+        }
+        if self.workspace_key.is_none() {
+            self.workspace_key = branch.workspace_key.clone();
+        }
+        if self.workspace_label.is_none() {
+            self.workspace_label = branch.workspace_label.clone();
+        }
+        for agent in &branch.agents {
+            if !self.agents.contains(agent) {
+                self.agents.push(agent.clone());
+            }
+        }
+        for model in &branch.models {
+            if !self
+                .models
+                .iter()
+                .any(|m| m.display_name == model.display_name)
+            {
+                self.models.push(model.clone());
+            }
+        }
+    }
+}
+
+/// Accumulate one message into a session bucket: tokens, cost, counts,
+/// activity window, title adoption, and the distinct-models list. Shared by
+/// the flat and subagent-rolled session aggregations. `owner_msg` is true
+/// when the message belongs to the bucket's own session (vs a rolled-in
+/// subagent): among owner messages the most recent title wins, so a
+/// mid-session rename surfaces the latest title, while a subagent title only
+/// fills an empty slot.
+fn accumulate_session_entry(
+    entry: &mut SessionUsage,
+    msg: &UnifiedMessage,
+    msg_cost: f64,
+    normalized_model: &str,
+    model_key: &str,
+    owner_msg: bool,
+) {
+    entry.tokens.input = entry
+        .tokens
+        .input
+        .saturating_add(msg.tokens.input.max(0) as u64);
+    entry.tokens.output = entry
+        .tokens
+        .output
+        .saturating_add(msg.tokens.output.max(0) as u64);
+    entry.tokens.cache_read = entry
+        .tokens
+        .cache_read
+        .saturating_add(msg.tokens.cache_read.max(0) as u64);
+    entry.tokens.cache_write = entry
+        .tokens
+        .cache_write
+        .saturating_add(msg.tokens.cache_write.max(0) as u64);
+    entry.tokens.reasoning = entry
+        .tokens
+        .reasoning
+        .saturating_add(msg.tokens.reasoning.max(0) as u64);
+    entry.cost += msg_cost;
+    entry.message_count = entry
+        .message_count
+        .saturating_add(msg.message_count.max(0) as u32);
+    if msg.is_turn_start {
+        entry.turn_count += 1;
+    }
+
+    let ts = message_timestamp_ms(msg);
+    if ts > 0 {
+        if entry.first_active_ms == 0 || ts < entry.first_active_ms {
+            entry.first_active_ms = ts;
+        }
+        if ts > entry.last_active_ms {
+            entry.last_active_ms = ts;
+        }
+    }
+
+    // Adopt the most recent non-empty session_title from the bucket's own
+    // messages (last-wins, so a mid-session rename surfaces the latest
+    // title); a subagent's title only fills the slot when the owner
+    // contributed none. Parsers that don't populate the field leave it
+    // `None` and the Sessions tab falls back to the ID.
+    if let Some(ref title) = msg.session_title {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() && (owner_msg || entry.title.is_none()) {
+            entry.title = Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(ref wk) = msg.workspace_key {
+        let trimmed = wk.trim();
+        if !trimmed.is_empty() && (owner_msg || entry.workspace_key.is_none()) {
+            entry.workspace_key = Some(trimmed.to_string());
+        }
+    }
+    if let Some(ref wl) = msg.workspace_label {
+        let trimmed = wl.trim();
+        if !trimmed.is_empty() && (owner_msg || entry.workspace_label.is_none()) {
+            entry.workspace_label = Some(trimmed.to_string());
+        }
+    }
+    if let Some(ref agent) = msg.agent {
+        let normalized = if msg.client == "opencode" {
+            sessions::normalize_opencode_agent_name(agent)
+        } else if msg.client == "copilot" {
+            sessions::normalize_copilot_agent_name(agent)
+        } else {
+            sessions::normalize_agent_name(agent)
+        };
+        let trimmed = normalized.trim();
+        if !trimmed.is_empty() && !entry.agents.iter().any(|a| a == trimmed) {
+            entry.agents.push(trimmed.to_string());
+        }
+    }
+
+    // Track distinct models in first-seen order, retaining provider and
+    // color_key for correct shade-map lookups.
+    if !entry
+        .models
+        .iter()
+        .any(|m| m.display_name == normalized_model)
+    {
+        entry.models.push(SessionModel {
+            display_name: normalized_model.to_string(),
+            provider: msg.provider_id.clone(),
+            color_key: model_key.to_string(),
+        });
+    }
 }
 
 /// A model entry within a session, retaining the provider and color_key
@@ -228,8 +444,13 @@ pub struct UsageData {
     pub monthly: Vec<MonthlyUsage>,
     pub sessions: Vec<SessionUsage>,
     pub projects: Vec<ProjectUsage>,
+    /// Sessions view with subagent sessions (messages carrying
+    /// `parent_session_id`) rolled into their parent session's row.
+    /// Recomputed alongside `sessions` on every aggregation.
+    pub sessions_rolled: Vec<SessionUsage>,
     pub graph: Option<GraphData>,
     pub total_tokens: u64,
+    pub undated_tokens: u64,
     pub total_cost: f64,
     pub loading: bool,
     pub error: Option<String>,
@@ -313,9 +534,11 @@ fn daily_source_model_key(
     match group_by {
         GroupBy::WorkspaceModel => workspace_model_daily_key(workspace_group_key, model),
         GroupBy::ClientProviderModel => format!("{provider_id}:{model}"),
-        GroupBy::Model | GroupBy::ClientModel | GroupBy::Session | GroupBy::ClientSession => {
-            model.to_string()
-        }
+        GroupBy::Model
+        | GroupBy::ClientModel
+        | GroupBy::Session
+        | GroupBy::ClientSession
+        | GroupBy::MachineModel => model.to_string(),
     }
 }
 
@@ -328,9 +551,11 @@ fn daily_source_model_display_name(
     match group_by {
         GroupBy::WorkspaceModel => workspace_model_display_label(workspace_label, model),
         GroupBy::ClientProviderModel => format!("{provider_id} / {model}"),
-        GroupBy::Model | GroupBy::ClientModel | GroupBy::Session | GroupBy::ClientSession => {
-            model.to_string()
-        }
+        GroupBy::Model
+        | GroupBy::ClientModel
+        | GroupBy::Session
+        | GroupBy::ClientSession
+        | GroupBy::MachineModel => model.to_string(),
     }
 }
 
@@ -341,7 +566,8 @@ fn model_color_key(group_by: &GroupBy, _provider_id: &str, model: &str) -> Strin
         | GroupBy::ClientModel
         | GroupBy::WorkspaceModel
         | GroupBy::Session
-        | GroupBy::ClientSession => model.to_string(),
+        | GroupBy::ClientSession
+        | GroupBy::MachineModel => model.to_string(),
     }
 }
 
@@ -352,7 +578,8 @@ fn hourly_model_key(group_by: &GroupBy, provider_id: &str, model: &str) -> Strin
         | GroupBy::ClientModel
         | GroupBy::WorkspaceModel
         | GroupBy::Session
-        | GroupBy::ClientSession => model.to_string(),
+        | GroupBy::ClientSession
+        | GroupBy::MachineModel => model.to_string(),
     }
 }
 
@@ -363,7 +590,8 @@ fn hourly_model_display_name(group_by: &GroupBy, provider_id: &str, model: &str)
         | GroupBy::ClientModel
         | GroupBy::WorkspaceModel
         | GroupBy::Session
-        | GroupBy::ClientSession => model.to_string(),
+        | GroupBy::ClientSession
+        | GroupBy::MachineModel => model.to_string(),
     }
 }
 
@@ -458,6 +686,63 @@ impl DataLoader {
         self.aggregate_messages(messages, group_by)
     }
 
+    /// Build complete TUI data while leaving only the durable source-cache
+    /// write pending. The caller owns that write and must persist it on the
+    /// same background loader thread after publishing the aggregate data.
+    pub fn load_deferred(
+        &self,
+        enabled_clients: &[ClientId],
+        group_by: &GroupBy,
+        include_synthetic: bool,
+    ) -> Result<(UsageData, PendingSourceCacheSave)> {
+        let home = crate::paths::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+            .to_string_lossy()
+            .to_string();
+
+        let mut sources: Vec<String> = enabled_clients
+            .iter()
+            .map(|client| client.as_str().to_string())
+            .collect();
+        if include_synthetic {
+            sources.push("synthetic".to_string());
+        }
+
+        let opts = LocalParseOptions {
+            home_dir: Some(home),
+            use_env_roots: true,
+            clients: Some(sources),
+            since: self.since.clone(),
+            until: self.until.clone(),
+            year: self.year.clone(),
+            scanner_settings: data_loader_scanner_settings(),
+        };
+
+        let (messages, pending_save) = if Handle::try_current().is_ok() {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = Runtime::new().map_err(|e| e.to_string())?;
+                    rt.block_on(parse_local_unified_messages_deferred(opts))
+                })
+                .join()
+                .unwrap_or_else(|_| Err("data loader thread panicked".to_string()))
+            })
+        } else {
+            Runtime::new()?.block_on(parse_local_unified_messages_deferred(opts))
+        }
+        .map_err(anyhow::Error::msg)?;
+
+        match self.aggregate_messages(messages, group_by) {
+            Ok(data) => Ok((data, pending_save)),
+            Err(error) => {
+                // Parsing has already mutated the owned source cache. Do not
+                // throw that work away merely because TUI aggregation failed.
+                pending_save.persist();
+                Err(error)
+            }
+        }
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     fn load_with_pricing(
@@ -525,6 +810,7 @@ impl DataLoader {
         let mut hourly_map: HashMap<NaiveDateTime, HourlyUsage> = HashMap::new();
         let mut minutely_map: HashMap<NaiveDateTime, MinutelyUsage> = HashMap::new();
         let mut model_session_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut model_days: HashMap<String, BTreeMap<NaiveDate, ModelDayUsage>> = HashMap::new();
         let mut session_map: HashMap<String, SessionUsage> = HashMap::new();
         let mut project_map: HashMap<String, ProjectUsage> = HashMap::new();
         let mut project_session_ids: HashMap<String, HashSet<String>> = HashMap::new();
@@ -586,8 +872,29 @@ impl DataLoader {
                 }
             }
         }
+        let mut session_rolled_map: HashMap<String, SessionUsage> = HashMap::new();
+        // Distinct subagent session ids rolled into each bucket, so the
+        // "(+N)" marker counts sessions, not messages.
+        let mut rolled_child_sessions: HashMap<String, HashSet<String>> = HashMap::new();
+        // Immediate-parent edge per subagent session (child key -> parent
+        // key), recorded once per link. Messages name only their immediate
+        // parent, so sub-sub-agent chains are resolved to the root session
+        // from these edges after the pass.
+        // With --since/--until, an intermediate session may have no surviving
+        // usage and therefore no edge: its descendants roll up under their
+        // immediate parent instead of the root. Totals are preserved.
+        let mut rolled_parent_of: HashMap<String, String> = HashMap::new();
 
         for msg in &messages {
+            // Recovered daily-floor rows are day-level aggregates with a
+            // synthetic session/agent identity; they must not appear as fake
+            // sessions in the Sessions tab or fake agents in the Agents tab.
+            // Their tokens and cost still count toward the model, daily and
+            // project aggregates below (hourly and minutely skip them, since a
+            // day-level fill has no intra-day shape), so this is filtered per
+            // aggregation rather than by dropping the message from the loop.
+            // Their synthetic session id is also kept out of session counts.
+            let is_recovery_floor = tokscale_core::recovery::is_daily(msg);
             let normalized_model =
                 model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
             let model_key = normalize_model_for_grouping(&msg.model_id);
@@ -645,8 +952,22 @@ impl DataLoader {
                 GroupBy::ClientSession => {
                     format!("{}:{}:{}", msg.client, msg.session_id, normalized_model)
                 }
+                GroupBy::MachineModel => {
+                    let machine = tokscale_core::message_machine_label(msg);
+                    format!("{}:{}:{}", machine.len(), machine, normalized_model)
+                }
             };
-            let merge_clients = matches!(group_by, GroupBy::Model | GroupBy::WorkspaceModel);
+            let merge_clients = matches!(
+                group_by,
+                GroupBy::Model | GroupBy::WorkspaceModel | GroupBy::MachineModel
+            );
+            // What the time-period views' Source column lists: the machine for
+            // `machine,model`, the client otherwise.
+            let period_source = if *group_by == GroupBy::MachineModel {
+                tokscale_core::message_machine_label(msg)
+            } else {
+                msg.client.as_str()
+            };
 
             let model_entry = model_map.entry(key.clone()).or_insert_with(|| ModelUsage {
                 model: normalized_model.clone(),
@@ -663,10 +984,17 @@ impl DataLoader {
                 } else {
                     None
                 },
+                machine: if *group_by == GroupBy::MachineModel {
+                    Some(tokscale_core::message_machine_label(msg).to_string())
+                } else {
+                    None
+                },
                 tokens: TokenBreakdown::default(),
                 cost: 0.0,
                 performance: ModelPerformance::default(),
                 session_count: 0,
+                group_key: key.clone(),
+                daily: Vec::new(),
             });
 
             if merge_clients && !model_entry.client.split(", ").any(|s| s == msg.client) {
@@ -712,59 +1040,107 @@ impl DataLoader {
                 .performance
                 .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
 
-            let session_key = format!("{}:{}", msg.client, msg.session_id);
-            let model_sessions = model_session_ids.entry(key).or_default();
-            if model_sessions.insert(session_key) {
-                model_entry.session_count += 1;
-            }
-
-            if let Some(agent) = msg.agent.as_ref() {
-                let normalized_agent = if msg.client == "opencode" {
-                    sessions::normalize_opencode_agent_name(agent)
-                } else if msg.client == "copilot" {
-                    sessions::normalize_copilot_agent_name(agent)
-                } else {
-                    sessions::normalize_agent_name(agent)
-                };
-                let agent_entry = agent_map
-                    .entry(normalized_agent.clone())
-                    .or_insert_with(|| AgentUsage {
-                        agent: normalized_agent.clone(),
-                        clients: String::new(),
+            if let Some(date) = parse_date(&msg.date) {
+                let model_day = model_days
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(date)
+                    .or_insert_with(|| ModelDayUsage {
+                        date,
                         tokens: TokenBreakdown::default(),
                         cost: 0.0,
-                        message_count: 0,
+                        messages: 0,
+                        performance: ModelPerformance::default(),
                     });
-
-                agent_entry.tokens.input = agent_entry
+                model_day.tokens.input = model_day
                     .tokens
                     .input
                     .saturating_add(msg.tokens.input.max(0) as u64);
-                agent_entry.tokens.output = agent_entry
+                model_day.tokens.output = model_day
                     .tokens
                     .output
                     .saturating_add(msg.tokens.output.max(0) as u64);
-                agent_entry.tokens.cache_read = agent_entry
+                model_day.tokens.cache_read = model_day
                     .tokens
                     .cache_read
                     .saturating_add(msg.tokens.cache_read.max(0) as u64);
-                agent_entry.tokens.cache_write = agent_entry
+                model_day.tokens.cache_write = model_day
                     .tokens
                     .cache_write
                     .saturating_add(msg.tokens.cache_write.max(0) as u64);
-                agent_entry.tokens.reasoning = agent_entry
+                model_day.tokens.reasoning = model_day
                     .tokens
                     .reasoning
                     .saturating_add(msg.tokens.reasoning.max(0) as u64);
-                agent_entry.cost += msg_cost;
-                agent_entry.message_count = agent_entry
-                    .message_count
-                    .saturating_add(msg.message_count.max(0) as u32);
+                model_day.cost += msg_cost;
+                model_day.messages = model_day
+                    .messages
+                    .saturating_add(msg.message_count.max(0) as u64);
+                model_day
+                    .performance
+                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+            }
 
-                agent_clients
-                    .entry(normalized_agent)
-                    .or_default()
-                    .insert(msg.client.clone());
+            // A recovered daily floor has a synthetic session id; it adds usage
+            // but is not a session, so it must not raise session counts.
+            if !is_recovery_floor {
+                let session_key = format!("{}:{}", msg.client, msg.session_id);
+                let model_sessions = model_session_ids.entry(key).or_default();
+                if model_sessions.insert(session_key) {
+                    model_entry.session_count += 1;
+                }
+            }
+
+            if !is_recovery_floor {
+                if let Some(agent) = msg.agent.as_ref() {
+                    let normalized_agent = if msg.client == "opencode" {
+                        sessions::normalize_opencode_agent_name(agent)
+                    } else if msg.client == "copilot" {
+                        sessions::normalize_copilot_agent_name(agent)
+                    } else {
+                        sessions::normalize_agent_name(agent)
+                    };
+                    let agent_entry =
+                        agent_map
+                            .entry(normalized_agent.clone())
+                            .or_insert_with(|| AgentUsage {
+                                agent: normalized_agent.clone(),
+                                clients: String::new(),
+                                tokens: TokenBreakdown::default(),
+                                cost: 0.0,
+                                message_count: 0,
+                            });
+
+                    agent_entry.tokens.input = agent_entry
+                        .tokens
+                        .input
+                        .saturating_add(msg.tokens.input.max(0) as u64);
+                    agent_entry.tokens.output = agent_entry
+                        .tokens
+                        .output
+                        .saturating_add(msg.tokens.output.max(0) as u64);
+                    agent_entry.tokens.cache_read = agent_entry
+                        .tokens
+                        .cache_read
+                        .saturating_add(msg.tokens.cache_read.max(0) as u64);
+                    agent_entry.tokens.cache_write = agent_entry
+                        .tokens
+                        .cache_write
+                        .saturating_add(msg.tokens.cache_write.max(0) as u64);
+                    agent_entry.tokens.reasoning = agent_entry
+                        .tokens
+                        .reasoning
+                        .saturating_add(msg.tokens.reasoning.max(0) as u64);
+                    agent_entry.cost += msg_cost;
+                    agent_entry.message_count = agent_entry
+                        .message_count
+                        .saturating_add(msg.message_count.max(0) as u32);
+
+                    agent_clients
+                        .entry(normalized_agent)
+                        .or_default()
+                        .insert(msg.client.clone());
+                }
             }
 
             if let Some(date) = parse_date(&msg.date) {
@@ -810,7 +1186,7 @@ impl DataLoader {
 
                 let source_entry = daily_entry
                     .source_breakdown
-                    .entry(msg.client.clone())
+                    .entry(period_source.to_string())
                     .or_insert_with(|| DailySourceInfo {
                         tokens: TokenBreakdown::default(),
                         cost: 0.0,
@@ -861,6 +1237,7 @@ impl DataLoader {
                         tokens: TokenBreakdown::default(),
                         cost: 0.0,
                         messages: 0,
+                        performance: ModelPerformance::default(),
                     });
 
                 model_info.tokens.input = model_info
@@ -887,12 +1264,17 @@ impl DataLoader {
                 model_info.messages = model_info
                     .messages
                     .saturating_add(msg.message_count.max(0) as u64);
+                model_info
+                    .performance
+                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
             }
 
             // Hourly aggregation: derive hour from timestamp (Unix ms),
             // falling back to msg.date 00:00 when timestamp is missing/zero
             // so we don't silently drop messages (matches CLI bucketing).
-            if let Some(hour_dt) = hour_bucket_with_fallback(msg.timestamp, &msg.date) {
+            if let Some(hour_dt) = hour_bucket_with_fallback(msg.timestamp, &msg.date)
+                .filter(|_| !tokscale_core::recovery::is_daily(msg))
+            {
                 let hourly_entry = hourly_map.entry(hour_dt).or_insert_with(|| HourlyUsage {
                     datetime: hour_dt,
                     tokens: TokenBreakdown::default(),
@@ -933,7 +1315,7 @@ impl DataLoader {
                 if msg.is_turn_start {
                     hourly_entry.turn_count += 1;
                 }
-                hourly_entry.clients.insert(msg.client.clone());
+                hourly_entry.clients.insert(period_source.to_string());
 
                 let hourly_model_key =
                     hourly_model_key(group_by, &msg.provider_id, &normalized_model);
@@ -980,6 +1362,7 @@ impl DataLoader {
             // the tab do not pay the per-minute bucketing cost.
             let minute_bucket = if self.minutely_enabled {
                 minute_bucket_with_fallback(msg.timestamp, &msg.date)
+                    .filter(|_| !tokscale_core::recovery::is_daily(msg))
             } else {
                 None
             };
@@ -1027,7 +1410,7 @@ impl DataLoader {
                 if msg.is_turn_start {
                     minutely_entry.turn_count += 1;
                 }
-                minutely_entry.clients.insert(msg.client.clone());
+                minutely_entry.clients.insert(period_source.to_string());
 
                 let m_model_key = hourly_model_key(group_by, &msg.provider_id, &normalized_model);
                 let m_model =
@@ -1073,87 +1456,57 @@ impl DataLoader {
             // Skips messages with an empty session_id (some legacy/scanner
             // records lack one) rather than lumping them into a single bogus
             // "no-session" row.
-            if !msg.session_id.is_empty() {
+            //
+            // A second, parallel aggregation rolls subagent sessions (OMP
+            // transcripts carrying `parent_session_id`) into their parent's
+            // bucket so the Sessions tab can show the full cost of a session
+            // including its subagents. Sub-sub-agent chains land one level
+            // down here and fold into the root session after the pass. Both
+            // views are built in the same pass because messages are dropped
+            // after aggregation.
+            if !is_recovery_floor && !msg.session_id.is_empty() {
                 let session_key = format!("{}:{}", msg.client, msg.session_id);
-                let session_entry =
-                    session_map
-                        .entry(session_key)
-                        .or_insert_with(|| SessionUsage {
-                            session_id: msg.session_id.clone(),
-                            client: msg.client.clone(),
-                            title: None,
-                            models: Vec::new(),
-                            tokens: TokenBreakdown::default(),
-                            cost: 0.0,
-                            message_count: 0,
-                            turn_count: 0,
-                            first_active_ms: 0,
-                            last_active_ms: 0,
-                        });
+                let session_entry = session_map
+                    .entry(session_key)
+                    .or_insert_with(|| SessionUsage::new(&msg.client, &msg.session_id));
+                accumulate_session_entry(
+                    session_entry,
+                    msg,
+                    msg_cost,
+                    &normalized_model,
+                    &model_key,
+                    true,
+                );
 
-                session_entry.tokens.input = session_entry
-                    .tokens
-                    .input
-                    .saturating_add(msg.tokens.input.max(0) as u64);
-                session_entry.tokens.output = session_entry
-                    .tokens
-                    .output
-                    .saturating_add(msg.tokens.output.max(0) as u64);
-                session_entry.tokens.cache_read = session_entry
-                    .tokens
-                    .cache_read
-                    .saturating_add(msg.tokens.cache_read.max(0) as u64);
-                session_entry.tokens.cache_write = session_entry
-                    .tokens
-                    .cache_write
-                    .saturating_add(msg.tokens.cache_write.max(0) as u64);
-                session_entry.tokens.reasoning = session_entry
-                    .tokens
-                    .reasoning
-                    .saturating_add(msg.tokens.reasoning.max(0) as u64);
-                session_entry.cost += msg_cost;
-                session_entry.message_count = session_entry
-                    .message_count
-                    .saturating_add(msg.message_count.max(0) as u32);
-                if msg.is_turn_start {
-                    session_entry.turn_count += 1;
-                }
-
-                let ts = message_timestamp_ms(msg);
-                if ts > 0 {
-                    if session_entry.first_active_ms == 0 || ts < session_entry.first_active_ms {
-                        session_entry.first_active_ms = ts;
+                let (rolled_session_id, is_subagent_msg) = match msg.parent_session_id.as_deref() {
+                    Some(parent) if !parent.is_empty() && parent != msg.session_id => {
+                        (parent, true)
                     }
-                    if ts > session_entry.last_active_ms {
-                        session_entry.last_active_ms = ts;
-                    }
-                }
-
-                // Adopt the first non-empty session_title seen across the
-                // session's messages. Parsers that don't populate the field
-                // leave it `None` and the Sessions tab falls back to the ID.
-                if session_entry.title.is_none() {
-                    if let Some(ref title) = msg.session_title {
-                        let trimmed = title.trim();
-                        if !trimmed.is_empty() {
-                            session_entry.title = Some(trimmed.to_string());
-                        }
-                    }
-                }
-
-                // Track distinct models in first-seen order, retaining
-                // provider and color_key for correct shade-map lookups.
-                if !session_entry
-                    .models
-                    .iter()
-                    .any(|m| m.display_name == normalized_model)
+                    _ => (msg.session_id.as_str(), false),
+                };
+                let rolled_key = format!("{}:{}", msg.client, rolled_session_id);
+                let rolled_entry = session_rolled_map
+                    .entry(rolled_key.clone())
+                    .or_insert_with(|| SessionUsage::new(&msg.client, rolled_session_id));
+                if is_subagent_msg
+                    && rolled_child_sessions
+                        .entry(rolled_key.clone())
+                        .or_default()
+                        .insert(msg.session_id.clone())
                 {
-                    session_entry.models.push(SessionModel {
-                        display_name: normalized_model.clone(),
-                        provider: msg.provider_id.clone(),
-                        color_key: model_key.clone(),
-                    });
+                    // First sight of this link: remember the edge so the
+                    // chain fold below can resolve it to the root.
+                    rolled_parent_of
+                        .insert(format!("{}:{}", msg.client, msg.session_id), rolled_key);
                 }
+                accumulate_session_entry(
+                    rolled_entry,
+                    msg,
+                    msg_cost,
+                    &normalized_model,
+                    &model_key,
+                    !is_subagent_msg,
+                );
             }
 
             // Project aggregation: one bucket per repo identity so the Projects
@@ -1231,7 +1584,7 @@ impl DataLoader {
                     });
                 }
 
-                if !msg.session_id.is_empty() {
+                if !is_recovery_floor && !msg.session_id.is_empty() {
                     let session_key = format!("{}:{}", msg.client, msg.session_id);
                     let project_sessions = project_session_ids
                         .entry(project_group_key.clone())
@@ -1246,7 +1599,19 @@ impl DataLoader {
         let mut models: Vec<ModelUsage> = model_map
             .into_values()
             .map(|mut model| {
-                model.performance.finalize(model.tokens.total() as i64);
+                model
+                    .performance
+                    .finalize(i64::try_from(model.tokens.total()).unwrap_or(i64::MAX));
+                model.daily = model_days
+                    .remove(&model.group_key)
+                    .unwrap_or_default()
+                    .into_values()
+                    .map(|mut day| {
+                        day.performance
+                            .finalize(i64::try_from(day.tokens.total()).unwrap_or(i64::MAX));
+                        day
+                    })
+                    .collect();
                 model
             })
             .collect();
@@ -1271,7 +1636,19 @@ impl DataLoader {
                 .then_with(|| a.agent.cmp(&b.agent))
         });
 
-        let mut daily: Vec<DailyUsage> = daily_map.into_values().collect();
+        let mut daily: Vec<DailyUsage> = daily_map
+            .into_values()
+            .map(|mut day| {
+                for source in day.source_breakdown.values_mut() {
+                    for model in source.models.values_mut() {
+                        model
+                            .performance
+                            .finalize(i64::try_from(model.tokens.total()).unwrap_or(i64::MAX));
+                    }
+                }
+                day
+            })
+            .collect();
         daily.sort_by_key(|b| std::cmp::Reverse(b.date));
 
         let mut hourly: Vec<HourlyUsage> = hourly_map.into_values().collect();
@@ -1282,14 +1659,64 @@ impl DataLoader {
 
         let monthly = aggregate_monthly_from_daily(&daily);
 
+        // Fold sub-sub-agent chains into the root session: a message names
+        // only its immediate parent, so an intermediate subagent would
+        // otherwise surface as a rolled row holding only its own children.
+        // Cyclic links (corrupt data) stay as direct-parent roll-ups.
+        for child_key in rolled_parent_of.keys() {
+            let root_key = {
+                let mut root = child_key.clone();
+                let mut seen = HashSet::new();
+                while seen.insert(root.clone()) {
+                    match rolled_parent_of.get(&root) {
+                        Some(parent) => root = parent.clone(),
+                        None => break,
+                    }
+                }
+                root
+            };
+            if child_key == &root_key {
+                continue;
+            }
+            let Some(child_entry) = session_rolled_map.remove(child_key) else {
+                continue;
+            };
+            let Some(root_entry) = session_rolled_map.get_mut(&root_key) else {
+                // A chain whose intermediate session contributed no surviving
+                // message (a date filter cut its rows, or it emitted no usage)
+                // has no edge to its own parent, so the root cannot be
+                // resolved. Keep the child's row rather than drop its usage.
+                session_rolled_map.insert(child_key.clone(), child_entry);
+                continue;
+            };
+            root_entry.merge_subagent_branch(&child_entry);
+            if let Some(children) = rolled_child_sessions.remove(child_key) {
+                rolled_child_sessions
+                    .entry(root_key)
+                    .or_default()
+                    .extend(children);
+            }
+        }
+
+        for (key, children) in rolled_child_sessions {
+            if let Some(entry) = session_rolled_map.get_mut(&key) {
+                entry.subagent_count = children.len() as u32;
+            }
+        }
+
+        let sort_sessions = |sessions: &mut Vec<SessionUsage>| {
+            sessions.sort_by(|a, b| {
+                b.cost
+                    .total_cmp(&a.cost)
+                    .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
+                    .then_with(|| a.client.cmp(&b.client))
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            });
+        };
         let mut sessions: Vec<SessionUsage> = session_map.into_values().collect();
-        sessions.sort_by(|a, b| {
-            b.cost
-                .total_cmp(&a.cost)
-                .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
-                .then_with(|| a.client.cmp(&b.client))
-                .then_with(|| a.session_id.cmp(&b.session_id))
-        });
+        sort_sessions(&mut sessions);
+        let mut sessions_rolled: Vec<SessionUsage> = session_rolled_map.into_values().collect();
+        sort_sessions(&mut sessions_rolled);
 
         let mut projects: Vec<ProjectUsage> = project_map.into_values().collect();
         // Path resolution is deferred to here so it runs once per distinct
@@ -1329,8 +1756,15 @@ impl DataLoader {
             monthly,
             sessions,
             projects,
+            sessions_rolled,
             graph: Some(graph),
             total_tokens,
+            undated_tokens: messages
+                .iter()
+                .filter(|m| tokscale_core::claude_desktop::is_undated_balance(m))
+                .fold(0u64, |total, m| {
+                    total.saturating_add(m.tokens.total().max(0) as u64)
+                }),
             total_cost,
             loading: false,
             error: None,
@@ -1668,9 +2102,14 @@ pub fn find_peak_hour(hourly: &[HourlyUsage]) -> Option<(u32, u64, f64)> {
         entry_totals.1 += entry.cost;
     }
 
+    // HashMap iteration order is random, so a tokens-only max can pick a
+    // different tied hour on each call. Break ties by the earliest hour so
+    // Stats and Hourly Profile agree.
     hour_totals
         .into_iter()
-        .max_by_key(|(_, (tokens, _))| *tokens)
+        .max_by(|(hour_a, (tokens_a, _)), (hour_b, (tokens_b, _))| {
+            tokens_a.cmp(tokens_b).then(hour_b.cmp(hour_a))
+        })
         .map(|(hour, (tokens, cost))| (hour, tokens, cost))
 }
 
@@ -1678,7 +2117,7 @@ pub fn find_peak_hour(hourly: &[HourlyUsage]) -> Option<(u32, u64, f64)> {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::env;
     use std::fs;
     use tempfile::TempDir;
@@ -1686,6 +2125,101 @@ mod tests {
     use tokscale_core::parse_local_unified_messages_with_pricing;
     use tokscale_core::pricing::{ModelPricing, PricingService};
     use tokscale_core::TokenBreakdown as CoreTokenBreakdown;
+
+    #[test]
+    fn accumulate_session_entry_normalizes_and_deduplicates_agents() {
+        let mut entry = SessionUsage::new("opencode", "sess-test");
+        let mut msg = UnifiedMessage {
+            client: "opencode".to_string(),
+            model_id: "test-model".to_string(),
+            provider_id: "test-provider".to_string(),
+            session_id: "sess-test".to_string(),
+            workspace_key: Some("/path/to/project".to_string()),
+            workspace_label: Some("project".to_string()),
+            timestamp: 1_700_000_000,
+            date: "2023-11-14".to_string(),
+            tokens: tokscale_core::TokenBreakdown::default(),
+            cost: 0.0,
+            cost_source: tokscale_core::sessions::CostSource::default(),
+            service_tier: None,
+            duration_ms: None,
+            message_count: 1,
+            agent: Some("hephaestus".to_string()),
+            dedup_key: None,
+            session_title: None,
+            parent_session_id: None,
+            is_turn_start: false,
+            model_attribution_conflicted: false,
+            billing_identity: tokscale_core::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: tokscale_core::sessions::EstimateStatus::Unpriced,
+            copilot_context: None,
+            machine_label: None,
+        };
+
+        accumulate_session_entry(&mut entry, &msg, 0.0, "test-model", "test-model", true);
+        assert_eq!(entry.agents, vec!["Hephaestus".to_string()]);
+
+        // Duplicate with variant formatting doesn't add duplicate
+        msg.agent = Some(" Hephaestus ".to_string());
+        accumulate_session_entry(&mut entry, &msg, 0.0, "test-model", "test-model", true);
+        assert_eq!(entry.agents, vec!["Hephaestus".to_string()]);
+    }
+
+    #[test]
+    fn find_peak_hour_breaks_token_ties_by_earliest_hour() {
+        let date = NaiveDate::from_ymd_opt(2026, 5, 29).unwrap();
+        let hour = |h: u32, tokens: u64| HourlyUsage {
+            datetime: date.and_hms_opt(h, 0, 0).unwrap(),
+            tokens: TokenBreakdown {
+                input: tokens,
+                ..TokenBreakdown::default()
+            },
+            cost: 1.0,
+            clients: BTreeSet::new(),
+            models: BTreeMap::new(),
+            message_count: 1,
+            turn_count: 1,
+        };
+
+        let early_first = vec![hour(3, 50), hour(18, 50), hour(9, 10)];
+        let late_first = vec![hour(18, 50), hour(3, 50), hour(9, 10)];
+        assert_eq!(find_peak_hour(&early_first).map(|peak| peak.0), Some(3));
+        assert_eq!(find_peak_hour(&late_first).map(|peak| peak.0), Some(3));
+        assert_eq!(
+            find_peak_hour(&[hour(18, 50), hour(3, 80)]).map(|peak| peak.0),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn desktop_undated_balances_appear_in_models_but_not_calendar() {
+        let mut message = UnifiedMessage::new(
+            "claude",
+            "claude-future",
+            "anthropic",
+            "s",
+            0,
+            CoreTokenBreakdown {
+                input: 100,
+                ..Default::default()
+            },
+            0.0,
+        );
+        message.date = tokscale_core::claude_desktop::UNKNOWN_DATE.into();
+        message.message_count = 0;
+        let loader = DataLoader::new(None).with_minutely_enabled(true);
+        let data = loader
+            .aggregate_messages(vec![message], &GroupBy::Model)
+            .unwrap();
+        assert_eq!(data.total_tokens, 100);
+        assert_eq!(data.undated_tokens, 100);
+        assert_eq!(data.models.len(), 1);
+        assert!(data.daily.is_empty());
+        assert!(data.hourly.is_empty());
+        assert!(data.minutely.is_empty());
+        assert!(data.monthly.is_empty());
+    }
 
     #[test]
     fn positive_unified_token_total_saturates_instead_of_overflowing() {
@@ -1696,6 +2230,7 @@ mod tests {
             output: 0,
             cache_read: i64::MAX,
             cache_write: -5,
+            cache_write_1h: 0,
             reasoning: 0,
         };
         assert_eq!(positive_unified_token_total(&tokens), i64::MAX);
@@ -1816,6 +2351,7 @@ mod tests {
                 output: 5,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             cost,
@@ -1883,6 +2419,12 @@ mod tests {
         assert_eq!(clients[49], ClientId::Omp);
         assert_eq!(clients[50], ClientId::LmStudio);
         assert_eq!(clients[51], ClientId::Unsloth);
+        assert_eq!(clients[52], ClientId::Hindsight);
+        assert_eq!(clients[53], ClientId::MiMoDesktop);
+        assert_eq!(clients[54], ClientId::Muse);
+        assert_eq!(clients[55], ClientId::AntigravityExtension);
+        assert_eq!(clients[56], ClientId::Aside);
+        assert_eq!(clients[57], ClientId::Vibe);
     }
 
     #[test]
@@ -1941,6 +2483,12 @@ mod tests {
             "LM Studio",
             "Unsloth",
             "Hindsight",
+            "Xiaomi MiMo AI",
+            "Muse Code",
+            "Antigravity IDE Extension",
+            "Aside",
+            "Mistral Vibe",
+            "Proma",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);
@@ -1990,10 +2538,23 @@ mod tests {
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Omp), 'Y');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::LmStudio), 'L');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Unsloth), 'U');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Hindsight), 'H');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::MiMoDesktop), 'W');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Muse), 'N');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Aside), 'V');
+        assert_eq!(
+            crate::tui::client_ui::hotkey(ClientId::AntigravityExtension),
+            'I'
+        );
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Vibe), 'T');
     }
 
     #[test]
     fn test_client_from_key() {
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('V'),
+            Some(ClientId::Aside)
+        );
         assert_eq!(
             crate::tui::client_ui::from_hotkey('1'),
             Some(ClientId::OpenCode)
@@ -2109,6 +2670,10 @@ mod tests {
         assert_eq!(
             crate::tui::client_ui::from_hotkey('P'),
             Some(ClientId::PrimeAgent)
+        );
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('T'),
+            Some(ClientId::Vibe)
         );
     }
 
@@ -2249,6 +2814,7 @@ mod tests {
                     output: 5,
                     cache_read: 0,
                     cache_write: 0,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 1.25,
@@ -2265,6 +2831,7 @@ mod tests {
                     output: 10,
                     cache_read: 0,
                     cache_write: 0,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 2.75,
@@ -2303,6 +2870,7 @@ mod tests {
                         output: 0,
                         cache_read: 0,
                         cache_write: 0,
+                        cache_write_1h: 0,
                         reasoning: 0,
                     },
                     0.0,
@@ -2354,6 +2922,214 @@ mod tests {
         assert_eq!(usage.models[0].client, "claude, qwen");
         assert_eq!(usage.models[0].session_count, 2);
         assert_eq!(usage.models[0].cost, 4.0);
+    }
+
+    #[test]
+    fn test_aggregate_messages_machine_model_splits_rows_by_machine() {
+        let labeled = |client: &str, session: &str, machine: &str, cost: f64| {
+            let mut msg = make_workspace_message(
+                client,
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                session,
+                cost,
+                None,
+                None,
+            );
+            msg.machine_label = Some(machine.to_string());
+            msg
+        };
+        let loader = DataLoader::new(None);
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    labeled("claude", "session-1", "local", 1.0),
+                    labeled("qwen", "session-2", "local", 2.0),
+                    labeled("claude", "session-3", "steven", 4.0),
+                ],
+                &GroupBy::MachineModel,
+            )
+            .unwrap();
+
+        let mut models = usage.models;
+        models.sort_by(|a, b| a.machine.cmp(&b.machine));
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].machine.as_deref(), Some("local"));
+        assert_eq!(models[0].client, "claude, qwen");
+        assert_eq!(models[0].cost, 3.0);
+        assert_eq!(models[1].machine.as_deref(), Some("steven"));
+        assert_eq!(models[1].cost, 4.0);
+        assert_ne!(models[0].group_key, models[1].group_key);
+        assert_eq!(models[0].workspace_label, None);
+    }
+
+    /// Two messages in the same hour from two machines, one of them unlabeled.
+    fn two_machine_messages() -> Vec<UnifiedMessage> {
+        let local = make_workspace_message(
+            "claude",
+            "claude-sonnet-4-5-20250929",
+            "anthropic",
+            "session-1",
+            1.0,
+            None,
+            None,
+        );
+        let mut steven = make_workspace_message(
+            "pi",
+            "claude-sonnet-4-5-20250929",
+            "anthropic",
+            "session-2",
+            2.0,
+            None,
+            None,
+        );
+        steven.machine_label = Some("steven".to_string());
+        vec![local, steven]
+    }
+
+    #[test]
+    fn test_period_breakdowns_list_machines_for_machine_model() {
+        let loader = DataLoader::new(None).with_minutely_enabled(true);
+        let usage = loader
+            .aggregate_messages(two_machine_messages(), &GroupBy::MachineModel)
+            .unwrap();
+
+        assert_eq!(usage.daily.len(), 1);
+        let sources: Vec<&str> = usage.daily[0]
+            .source_breakdown
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(sources, vec!["local", "steven"]);
+        assert_eq!(usage.daily[0].source_breakdown["local"].cost, 1.0);
+        assert_eq!(usage.daily[0].source_breakdown["steven"].cost, 2.0);
+
+        assert_eq!(usage.hourly.len(), 1);
+        let hourly: Vec<&str> = usage.hourly[0].clients.iter().map(String::as_str).collect();
+        assert_eq!(hourly, vec!["local", "steven"]);
+        assert_eq!(usage.minutely.len(), 1);
+        let minutely: Vec<&str> = usage.minutely[0]
+            .clients
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(minutely, vec!["local", "steven"]);
+    }
+
+    #[test]
+    fn test_period_breakdowns_list_clients_for_client_model() {
+        let loader = DataLoader::new(None).with_minutely_enabled(true);
+        let usage = loader
+            .aggregate_messages(two_machine_messages(), &GroupBy::ClientModel)
+            .unwrap();
+
+        let sources: Vec<&str> = usage.daily[0]
+            .source_breakdown
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(sources, vec!["claude", "pi"]);
+        let hourly: Vec<&str> = usage.hourly[0].clients.iter().map(String::as_str).collect();
+        assert_eq!(hourly, vec!["claude", "pi"]);
+        let minutely: Vec<&str> = usage.minutely[0]
+            .clients
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(minutely, vec!["claude", "pi"]);
+    }
+
+    #[test]
+    fn test_aggregate_messages_tracks_speed_per_day_per_model() {
+        let timed = |date: &str, session: &str, duration_ms: Option<i64>| {
+            let mut msg = make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                session,
+                1.0,
+                None,
+                None,
+            );
+            msg.date = date.to_string();
+            msg.duration_ms = duration_ms;
+            msg
+        };
+        // 15 tokens per message: 30ms on day one is 2000ms/1K, 15ms on day
+        // two is 1000ms/1K. The untimed message adds tokens but no timing.
+        let usage = DataLoader::new(None)
+            .aggregate_messages(
+                vec![
+                    timed("2025-01-01", "session-1", Some(30)),
+                    timed("2025-01-01", "session-2", None),
+                    timed("2025-01-02", "session-3", Some(15)),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        let speed_on = |date: &str| {
+            let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+            let day = usage.daily.iter().find(|day| day.date == date).unwrap();
+            let model = day.source_breakdown["claude"]
+                .models
+                .values()
+                .next()
+                .unwrap();
+            model.performance.clone()
+        };
+
+        let day_one = speed_on("2025-01-01");
+        assert_eq!(day_one.ms_per_1k_tokens, Some(2000.0));
+        assert_eq!(day_one.sample_count, 1);
+        assert!((day_one.token_coverage - 0.5).abs() < 1e-9);
+        assert_eq!(speed_on("2025-01-02").ms_per_1k_tokens, Some(1000.0));
+
+        // The Models tab sees the same messages across both days, and its
+        // per-day trend matches the Daily tab day for day.
+        let model = &usage.models[0];
+        assert_eq!(model.performance.timed_tokens, 30);
+        assert_eq!(model.performance.total_duration_ms, 45);
+        let trend: Vec<(String, Option<f64>, u64)> = model
+            .daily
+            .iter()
+            .map(|day| {
+                (
+                    day.date.to_string(),
+                    day.performance.ms_per_1k_tokens,
+                    day.tokens.total(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            trend,
+            [
+                ("2025-01-01".to_string(), Some(2000.0), 30),
+                ("2025-01-02".to_string(), Some(1000.0), 15),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_aggregate_messages_keeps_session_rows_trends_apart() {
+        // Session grouping yields two Models rows with identical display
+        // fields; the group key keeps their trends from merging.
+        let usage = DataLoader::new(None)
+            .aggregate_messages(
+                vec![
+                    make_workspace_message("claude", "kimi-k2", "moonshot", "s1", 1.0, None, None),
+                    make_workspace_message("claude", "kimi-k2", "moonshot", "s2", 2.0, None, None),
+                ],
+                &GroupBy::Session,
+            )
+            .unwrap();
+
+        assert_eq!(usage.models.len(), 2);
+        assert_ne!(usage.models[0].group_key, usage.models[1].group_key);
+        for model in &usage.models {
+            assert_eq!(model.daily.len(), 1);
+            assert_eq!(model.daily[0].cost, model.cost);
+        }
     }
 
     #[test]
@@ -3099,6 +3875,7 @@ mod tests {
                             output: 5,
                             cache_read: 0,
                             cache_write: 0,
+                            cache_write_1h: 0,
                             reasoning: 0,
                         },
                         1.0,
@@ -3114,6 +3891,7 @@ mod tests {
                             output: 10,
                             cache_read: 0,
                             cache_write: 0,
+                            cache_write_1h: 0,
                             reasoning: 0,
                         },
                         2.0,
@@ -3165,6 +3943,7 @@ mod tests {
                             output: 5,
                             cache_read: 0,
                             cache_write: 0,
+                            cache_write_1h: 0,
                             reasoning: 0,
                         },
                         1.0,
@@ -3180,6 +3959,7 @@ mod tests {
                             output: 10,
                             cache_read: 0,
                             cache_write: 0,
+                            cache_write_1h: 0,
                             reasoning: 0,
                         },
                         2.0,
@@ -3222,6 +4002,7 @@ mod tests {
                     output: 5,
                     cache_read: 100,
                     cache_write: 20,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 1.5,
@@ -3238,6 +4019,7 @@ mod tests {
                     output: 10,
                     cache_read: 200,
                     cache_write: 40,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 2.5,
@@ -3272,6 +4054,7 @@ mod tests {
                     output: 5,
                     cache_read: 0,
                     cache_write: 0,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 1.5,
@@ -3288,6 +4071,7 @@ mod tests {
                     output: 10,
                     cache_read: 0,
                     cache_write: 0,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 2.5,
@@ -3321,6 +4105,7 @@ mod tests {
                     output: 5,
                     cache_read: 0,
                     cache_write: 0,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 1.5,
@@ -3337,6 +4122,7 @@ mod tests {
                     output: 10,
                     cache_read: 0,
                     cache_write: 0,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 2.5,
@@ -3444,64 +4230,25 @@ after"#,
         )
         .unwrap();
 
-        let architect_expected = expected_message_cost(
-            &pricing,
-            "claude-sonnet-4",
-            "anthropic",
-            CoreTokenBreakdown {
-                input: 420_000,
-                output: 120_000,
-                cache_read: 32_000,
-                cache_write: 0,
-                reasoning: 0,
-            },
-        ) + expected_message_cost(
-            &pricing,
-            "claude-sonnet-4",
-            "anthropic",
-            CoreTokenBreakdown {
-                input: 90_000,
-                output: 60_000,
-                cache_read: 12_000,
-                cache_write: 0,
-                reasoning: 0,
-            },
-        );
-        let reviewer_expected = expected_message_cost(
-            &pricing,
-            "claude-haiku-4",
-            "anthropic",
-            CoreTokenBreakdown {
-                input: 70_000,
-                output: 26_000,
-                cache_read: 8_000,
-                cache_write: 0,
-                reasoning: 0,
-            },
-        ) + expected_message_cost(
-            &pricing,
-            "claude-haiku-4",
-            "anthropic",
-            CoreTokenBreakdown {
-                input: 22_000,
-                output: 18_000,
-                cache_read: 3_000,
-                cache_write: 0,
-                reasoning: 0,
-            },
-        );
+        // The task log records a positive per-request `cost`, which is now
+        // kept as the client's own charge instead of being re-estimated, so
+        // the agent total is the sum of the logged values. `tokensIn` is gross
+        // of cache on these rows, so input is the residual and the cache
+        // buckets are counted once: (420k-32k)+120k+32k + (90k-12k)+60k+12k.
+        let architect_expected = 8.4 + 3.1;
+        let reviewer_expected = 1.8 + 0.9;
 
         assert_eq!(usage.agents.len(), 2);
         assert_eq!(usage.agents[0].agent, "Architect");
         assert_eq!(usage.agents[0].clients, "roocode");
         assert_eq!(usage.agents[0].message_count, 2);
         assert_cost_matches(usage.agents[0].cost, architect_expected);
-        assert_eq!(usage.agents[0].tokens.total(), 734_000);
+        assert_eq!(usage.agents[0].tokens.total(), 690_000);
 
         assert_eq!(usage.agents[1].agent, "Reviewer");
         assert_eq!(usage.agents[1].message_count, 2);
         assert_cost_matches(usage.agents[1].cost, reviewer_expected);
-        assert_eq!(usage.agents[1].tokens.total(), 147_000);
+        assert_eq!(usage.agents[1].tokens.total(), 136_000);
 
         match previous_home {
             Some(home) => unsafe { env::set_var("HOME", home) },
@@ -3550,6 +4297,7 @@ after"#,
                 output: 5,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
         );
@@ -3611,6 +4359,7 @@ after"#,
                 output,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             cost,
@@ -3639,6 +4388,7 @@ after"#,
             output: 5,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: 0,
         };
         let usage = loader
@@ -3694,6 +4444,213 @@ after"#,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_aggregate_messages_rolls_subagent_sessions_into_parent() {
+        let loader = DataLoader::new(None);
+        let base_ms = 1_735_689_600_000_i64;
+        let mk = |session_id: &str,
+                  title: Option<&str>,
+                  parent: Option<&str>,
+                  ms: i64,
+                  input: i64,
+                  cost: f64| {
+            let mut msg = UnifiedMessage::new(
+                "pi",
+                "gpt-5",
+                "openai",
+                session_id,
+                ms,
+                tokscale_core::TokenBreakdown {
+                    input,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cache_write_1h: 0,
+                    reasoning: 0,
+                },
+                cost,
+            );
+            msg.session_title = title.map(str::to_string);
+            msg.parent_session_id = parent.map(str::to_string);
+            msg
+        };
+
+        // Child messages come FIRST so the rolled bucket is created by a
+        // subagent: the parent's own title must still win when it arrives.
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    mk(
+                        "child-1",
+                        Some("[Sub]: scout work"),
+                        Some("parent-1"),
+                        base_ms + 2000,
+                        50,
+                        0.5,
+                    ),
+                    // Second message from the SAME subagent session: the
+                    // roll-up marker counts sessions, not messages.
+                    mk(
+                        "child-1",
+                        Some("[Sub]: scout work"),
+                        Some("parent-1"),
+                        base_ms + 2500,
+                        10,
+                        0.1,
+                    ),
+                    mk(
+                        "child-2",
+                        Some("[Sub]: orphan work"),
+                        Some("parent-missing"),
+                        base_ms + 3000,
+                        25,
+                        0.25,
+                    ),
+                    mk("parent-1", Some("Parent session"), None, base_ms, 100, 1.0),
+                    mk(
+                        "parent-1",
+                        Some("Parent session"),
+                        None,
+                        base_ms + 1000,
+                        100,
+                        1.0,
+                    ),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        // Flat view: one row per session, no roll-up markers.
+        assert_eq!(usage.sessions.len(), 3);
+        assert!(usage.sessions.iter().all(|s| s.subagent_count == 0));
+
+        // Rolled view: child-1 merged into parent-1; child-2 rolls under the
+        // (message-less) parent id instead of vanishing.
+        assert_eq!(usage.sessions_rolled.len(), 2);
+        let parent = usage
+            .sessions_rolled
+            .iter()
+            .find(|s| s.session_id == "parent-1")
+            .expect("parent row");
+        assert_eq!(parent.subagent_count, 1, "two messages, ONE subagent");
+        assert_eq!(parent.tokens.input, 260);
+        assert!((parent.cost - 2.6).abs() < 1e-9);
+        assert_eq!(parent.message_count, 4);
+        assert_eq!(parent.title.as_deref(), Some("Parent session"));
+        assert_eq!(parent.first_active_ms, base_ms);
+        assert_eq!(parent.last_active_ms, base_ms + 2500);
+
+        let orphan = usage
+            .sessions_rolled
+            .iter()
+            .find(|s| s.session_id == "parent-missing")
+            .expect("orphan parent row");
+        assert_eq!(orphan.subagent_count, 1);
+        assert_eq!(orphan.tokens.input, 25);
+        assert_eq!(orphan.title.as_deref(), Some("[Sub]: orphan work"));
+    }
+
+    #[test]
+    fn test_session_title_adoption_is_last_wins_on_rename() {
+        let loader = DataLoader::new(None);
+        let base_ms = 1_735_689_600_000_i64;
+        let mk = |title: Option<&str>, ms: i64| {
+            let mut msg = UnifiedMessage::new(
+                "pi",
+                "gpt-5",
+                "openai",
+                "session-1",
+                ms,
+                tokscale_core::TokenBreakdown {
+                    input: 10,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cache_write_1h: 0,
+                    reasoning: 0,
+                },
+                0.1,
+            );
+            msg.session_title = title.map(str::to_string);
+            msg
+        };
+
+        // Parsers emit titles point-in-time (see sessions::pi docs), so a
+        // mid-session rename arrives as later messages carrying the new
+        // title. The row must show the latest, not the first.
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    mk(Some("Old name"), base_ms),
+                    mk(Some("New name"), base_ms + 1000),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(
+            usage.sessions[0].title.as_deref(),
+            Some("New name"),
+            "a rename must surface the latest owner title"
+        );
+        assert_eq!(usage.sessions_rolled[0].title.as_deref(), Some("New name"));
+    }
+
+    #[test]
+    fn test_aggregate_messages_folds_sub_sub_agent_chains_into_root() {
+        let loader = DataLoader::new(None);
+        let base_ms = 1_735_689_600_000_i64;
+        let mk = |session_id: &str, parent: Option<&str>, ms: i64, input: i64| {
+            let mut msg = UnifiedMessage::new(
+                "pi",
+                "gpt-5",
+                "openai",
+                session_id,
+                ms,
+                tokscale_core::TokenBreakdown {
+                    input,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cache_write_1h: 0,
+                    reasoning: 0,
+                },
+                input as f64 / 100.0,
+            );
+            msg.parent_session_id = parent.map(str::to_string);
+            msg
+        };
+
+        // leaf -> mid -> root: a message names only its immediate parent, so
+        // without the chain fold the root row would miss the leaf and "mid"
+        // would surface as a rolled row holding only the leaf's usage.
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    mk("root", None, base_ms, 100),
+                    mk("mid", Some("root"), base_ms + 1000, 50),
+                    mk("leaf", Some("mid"), base_ms + 2000, 25),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        // Flat view still shows every session as its own row.
+        assert_eq!(usage.sessions.len(), 3);
+        assert!(usage.sessions.iter().all(|s| s.subagent_count == 0));
+
+        // Rolled view: the whole chain folds into the root session.
+        assert_eq!(usage.sessions_rolled.len(), 1);
+        let root = &usage.sessions_rolled[0];
+        assert_eq!(root.session_id, "root");
+        assert_eq!(root.subagent_count, 2, "mid and leaf both rolled in");
+        assert_eq!(root.tokens.input, 175);
+        assert!((root.cost - 1.75).abs() < 1e-9);
+        assert_eq!(root.message_count, 3);
+        assert_eq!(root.first_active_ms, base_ms);
+        assert_eq!(root.last_active_ms, base_ms + 2000);
     }
 
     #[test]
@@ -3879,6 +4836,54 @@ after"#,
         assert_eq!(usage.monthly[0].cost, 3.0);
     }
 
+    /// A recovered daily floor keeps its tokens in every day-level view (Daily,
+    /// Monthly, Models, Projects) so rollups agree, but it is not a session or
+    /// an agent and has no intra-day shape.
+    #[test]
+    fn test_recovery_floor_counts_toward_day_views_but_not_sessions_agents_or_hours() {
+        let mut loader = DataLoader::new(None);
+        loader.minutely_enabled = true;
+        loader.projects_enabled = true;
+        let base_ms = 1_736_899_200_000_i64; // 2025-01-15 00:00 UTC
+        let mut native = make_msg(base_ms + 3_600_000, 100, 50, 1.0);
+        native.agent = Some("build".into());
+        let mut floor = make_msg(0, 400, 200, 4.0);
+        let floor_key = "local-recovery:daily:claude:2025-01-15".to_string();
+        floor.session_id = floor_key.clone();
+        floor.dedup_key = Some(floor_key);
+        floor.date = native.date.clone();
+        floor.agent = Some("Recovered daily aggregate (component split estimated)".into());
+        assert!(tokscale_core::recovery::is_daily(&floor));
+
+        let usage = loader
+            .aggregate_messages(vec![native, floor], &GroupBy::Model)
+            .unwrap();
+
+        let daily_input: u64 = usage.daily.iter().map(|d| d.tokens.input).sum();
+        assert_eq!(daily_input, 500, "Daily must include the floor");
+        assert_eq!(
+            usage.monthly[0].tokens.input, 500,
+            "Monthly derives from Daily"
+        );
+        let model_input: u64 = usage.models.iter().map(|m| m.tokens.input).sum();
+        assert_eq!(model_input, 500, "Models must agree with Daily");
+        let project_input: u64 = usage.projects.iter().map(|p| p.tokens.input).sum();
+        assert_eq!(project_input, 500, "Projects must agree with Daily");
+        assert_eq!(usage.models.iter().map(|m| m.session_count).sum::<u32>(), 1);
+        assert_eq!(
+            usage.projects.iter().map(|p| p.session_count).sum::<u32>(),
+            1
+        );
+
+        assert_eq!(usage.sessions.len(), 1, "the floor is not a session");
+        assert_eq!(usage.agents.len(), 1, "the floor is not an agent");
+        assert_eq!(usage.agents[0].agent, "Build");
+        let hourly_input: u64 = usage.hourly.iter().map(|h| h.tokens.input).sum();
+        assert_eq!(hourly_input, 100, "a day-level fill has no hour");
+        let minutely_input: u64 = usage.minutely.iter().map(|m| m.tokens.input).sum();
+        assert_eq!(minutely_input, 100, "a day-level fill has no minute");
+    }
+
     #[test]
     fn test_aggregate_monthly_sorts_descending() {
         let daily = vec![
@@ -3901,5 +4906,113 @@ after"#,
         let monthly = aggregate_monthly_from_daily(&daily);
         assert_eq!(monthly[0].month, "2026-05");
         assert_eq!(monthly[1].month, "2026-03");
+    }
+}
+
+#[cfg(test)]
+mod subagent_rollup_tests {
+    use super::*;
+
+    fn session_message(id: &str, parent: Option<&str>, n: i64) -> UnifiedMessage {
+        let mut m = UnifiedMessage::new(
+            "omp",
+            "gpt-5",
+            "openai",
+            id,
+            1_735_689_600_000 + n * 1000,
+            tokscale_core::TokenBreakdown {
+                input: n,
+                output: n * 2,
+                cache_read: n * 3,
+                cache_write: n * 4,
+                cache_write_1h: n,
+                reasoning: n * 5,
+            },
+            n as f64 * 0.25,
+        );
+        m.parent_session_id = parent.map(str::to_owned);
+        m.is_turn_start = true;
+        m
+    }
+
+    fn assert_rollup_usage_conserved(u: &UsageData) {
+        for field in [0, 1, 2, 3, 4] {
+            let sum = |rows: &[SessionUsage]| -> u64 {
+                rows.iter()
+                    .map(|r| match field {
+                        0 => r.tokens.input,
+                        1 => r.tokens.output,
+                        2 => r.tokens.cache_read,
+                        3 => r.tokens.cache_write,
+                        _ => r.tokens.reasoning,
+                    })
+                    .sum()
+            };
+            assert_eq!(
+                sum(&u.sessions),
+                sum(&u.sessions_rolled),
+                "token bucket {field} must be conserved"
+            );
+        }
+        let cost = |rows: &[SessionUsage]| rows.iter().map(|s| s.cost).sum::<f64>();
+        assert_eq!(cost(&u.sessions), cost(&u.sessions_rolled));
+        assert_eq!(
+            u.sessions.iter().map(|s| s.message_count).sum::<u32>(),
+            u.sessions_rolled
+                .iter()
+                .map(|s| s.message_count)
+                .sum::<u32>()
+        );
+        assert_eq!(
+            u.sessions.iter().map(|s| s.turn_count).sum::<u32>(),
+            u.sessions_rolled.iter().map(|s| s.turn_count).sum::<u32>()
+        );
+    }
+
+    #[test]
+    fn rollup_conserves_all_buckets_across_deep_chains_and_message_order() {
+        for offset in 0..100 {
+            let mut messages = vec![
+                session_message("root", None, 1),
+                session_message("mid", Some("root"), 2),
+                session_message("leaf", Some("mid"), 3),
+                session_message("twig", Some("leaf"), 4),
+                session_message("sibling", Some("root"), 5),
+                session_message("other", None, 6),
+            ];
+            messages[0].session_title = Some("Owner".into());
+            messages[1].session_title = Some("Child".into());
+            messages.rotate_left(offset % 6);
+            let u = DataLoader::new(None)
+                .aggregate_messages(messages, &GroupBy::Model)
+                .unwrap();
+            assert_rollup_usage_conserved(&u);
+            assert_eq!(u.sessions_rolled.len(), 2);
+            let root = u
+                .sessions_rolled
+                .iter()
+                .find(|s| s.session_id == "root")
+                .unwrap();
+            assert_eq!(root.subagent_count, 4);
+            assert_eq!(root.title.as_deref(), Some("Owner"));
+        }
+    }
+
+    #[test]
+    fn rollup_preserves_usage_for_cyclic_and_self_parent_links() {
+        for _ in 0..100 {
+            let u = DataLoader::new(None)
+                .aggregate_messages(
+                    vec![
+                        session_message("a", Some("b"), 1),
+                        session_message("b", Some("a"), 2),
+                        session_message("leaf", Some("a"), 3),
+                        session_message("self", Some("self"), 4),
+                    ],
+                    &GroupBy::Model,
+                )
+                .unwrap();
+            assert_rollup_usage_conserved(&u);
+        }
     }
 }

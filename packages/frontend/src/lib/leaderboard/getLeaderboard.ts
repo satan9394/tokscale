@@ -1,3 +1,5 @@
+import { getLeaderboardDateRange } from "./dateRange";
+import type { ReportDateRange } from "@/lib/reportingPeriods";
 import { unstable_cache } from "next/cache";
 import { db, users } from "@/lib/db";
 import {
@@ -25,11 +27,6 @@ export type {
   SortBy,
 } from "@/lib/leaderboard/types";
 
-interface PeriodDateRange {
-  start: string;
-  end: string;
-}
-
 type LeaderboardQueryResult = {
   users: unknown;
   totalUsers: number | string | null;
@@ -48,48 +45,17 @@ type RankedLeaderboardDbRow = {
   totalCost: number | string | null;
 };
 
-function toUtcDateString(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
+type ScopedAllTimeAggregateRow = {
+  userId: string;
+  totalTokens: string;
+  totalCost: string;
+};
 
-function getPeriodDateRange(
-  period: Period,
-  now: Date = new Date(),
-  customFrom?: string,
-  customTo?: string,
-): PeriodDateRange | null {
-  if (period === "all") return null;
-  if (period === "custom") {
-    return customFrom && customTo ? { start: customFrom, end: customTo } : null;
-  }
+type ScopedAllTimeAggregateCachePayload =
+  | { kind: "rows"; rows: ScopedAllTimeAggregateRow[] }
+  | { kind: "oversized" };
 
-  const end = new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-  );
-  if (period === "week") {
-    const start = new Date(end);
-    start.setUTCDate(start.getUTCDate() - 6);
-    return { start: toUtcDateString(start), end: toUtcDateString(end) };
-  }
-  if (period === "last-month") {
-    const lastMonthEnd = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 0),
-    );
-    const lastMonthStart = new Date(
-      Date.UTC(lastMonthEnd.getUTCFullYear(), lastMonthEnd.getUTCMonth(), 1),
-    );
-    return {
-      start: toUtcDateString(lastMonthStart),
-      end: toUtcDateString(lastMonthEnd),
-    };
-  }
-  return {
-    start: toUtcDateString(
-      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
-    ),
-    end: toUtcDateString(end),
-  };
-}
+const SCOPED_ALL_TIME_CACHE_MAX_BYTES = 1024 * 1024;
 
 function mapLeaderboardUser(row: RankedLeaderboardDbRow): LeaderboardUser {
   return {
@@ -192,6 +158,10 @@ function escapeLeaderboardLike(value: string): string {
   return value.replace(/[!%_]/g, "!$&");
 }
 
+function normalizeDirectiveValues(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.toLowerCase()))).sort();
+}
+
 function resultQuery(
   base: ReturnType<typeof sql>,
   page: number,
@@ -211,11 +181,15 @@ function resultQuery(
   return sql`
     WITH aggregated AS (${base})${statRows},
     stats AS (
+      -- Hidden users are out of the headline totals as well as the ranking:
+      -- three hidden accounts held 99% of all-time tokens, so counting them
+      -- made the site-wide figure theirs rather than everyone else's.
       SELECT
         COALESCE(SUM(total_tokens), 0) AS total_tokens,
         COALESCE(SUM(total_cost), 0) AS total_cost,
         COUNT(*)::int AS unique_users
       FROM ${statSource}
+      WHERE leaderboard_hidden = false
     ),
     rankable AS (
       SELECT aggregated.*, ${sequentialRanks ? sql`ROW_NUMBER()` : sql`RANK()`} OVER (ORDER BY ${primary} DESC${sequentialRanks ? sql`, ${secondary} DESC, LOWER(username) ASC, user_id ASC` : sql``}) AS rank
@@ -247,10 +221,8 @@ async function fetchPeriodLeaderboardData(
   limit: number,
   sortBy: SortBy,
   search: string,
-  customFrom?: string,
-  customTo?: string,
+  range: ReportDateRange | null,
 ): Promise<LeaderboardData> {
-  const range = getPeriodDateRange(period, new Date(), customFrom, customTo);
   if (!range)
     return buildLeaderboardData(undefined, page, limit, period, sortBy);
   const parsed = parseSearchDirectives(search);
@@ -290,6 +262,104 @@ async function fetchPeriodLeaderboardData(
   return buildLeaderboardData(result[0], page, limit, period, sortBy);
 }
 
+function scopedAllTimeAggregateQuery(
+  clients: string[],
+  models: string[],
+): ReturnType<typeof sql> {
+  const usesModels = models.length > 0;
+  const selectedBreakdown = usesModels ? sql`model.value` : sql`client.value`;
+  const clientMatch = likeAny(sql`client.key`, clients);
+  const modelRows = usesModels
+    ? sql`CROSS JOIN LATERAL jsonb_each(COALESCE(client.value->'models', '{}'::jsonb)) AS model(key, value)`
+    : sql``;
+  const modelFilter = usesModels ? sql`WHERE ${likeAny(sql`model.key`, models)}` : sql``;
+
+  return sql`
+    SELECT
+      s.user_id AS "userId",
+      SUM(COALESCE((${selectedBreakdown}->>'tokens')::numeric, 0))::text AS "totalTokens",
+      SUM(COALESCE((${selectedBreakdown}->>'cost')::numeric, 0))::text AS "totalCost"
+    FROM daily_breakdown d
+    INNER JOIN submissions s ON d.submission_id = s.id
+    CROSS JOIN LATERAL (
+      SELECT client.key, client.value
+      FROM jsonb_each(COALESCE(d.source_breakdown, '{}'::jsonb)) AS client(key, value)
+      WHERE ${clientMatch}
+    ) AS client
+    ${modelRows}
+    ${modelFilter}
+    GROUP BY s.user_id
+  `;
+}
+
+async function fetchScopedAllTimeAggregateRows(
+  clients: string[],
+  models: string[],
+): Promise<ScopedAllTimeAggregateRow[]> {
+  return db.execute<ScopedAllTimeAggregateRow>(
+    scopedAllTimeAggregateQuery(clients, models),
+  );
+}
+
+async function fetchScopedAllTimeAggregateCachePayload(
+  clients: string[],
+  models: string[],
+): Promise<ScopedAllTimeAggregateCachePayload> {
+  const rows = await fetchScopedAllTimeAggregateRows(clients, models);
+  const serialized = JSON.stringify(rows);
+  // Keep Next's incremental-cache entry comfortably below its per-entry size guard.
+  if (new TextEncoder().encode(serialized).byteLength > SCOPED_ALL_TIME_CACHE_MAX_BYTES) {
+    return { kind: "oversized" };
+  }
+  return { kind: "rows", rows };
+}
+
+function getCachedScopedAllTimeAggregate(
+  clients: string[],
+  models: string[],
+): Promise<ScopedAllTimeAggregateCachePayload> {
+  return unstable_cache(
+    () => fetchScopedAllTimeAggregateCachePayload(clients, models),
+    [`leaderboard:all:scoped:${JSON.stringify([clients, models])}`],
+    { tags: ["leaderboard", "leaderboard:all"], revalidate: 300 },
+  )();
+}
+
+function scopedAllTimeDirectBase(
+  clients: string[],
+  models: string[],
+): ReturnType<typeof sql> {
+  const aggregate = scopedAllTimeAggregateQuery(clients, models);
+  return sql`
+    SELECT
+      scoped."userId" AS user_id,
+      u.username,
+      u.display_name,
+      u.avatar_url,
+      u.leaderboard_hidden,
+      scoped."totalTokens"::numeric AS total_tokens,
+      scoped."totalCost"::numeric AS total_cost
+    FROM (${aggregate}) AS scoped
+    INNER JOIN users u ON scoped."userId" = u.id
+  `;
+}
+
+function scopedAllTimeCachedBase(rows: ScopedAllTimeAggregateRow[]): ReturnType<typeof sql> {
+  return sql`
+    SELECT
+      scoped."userId" AS user_id,
+      u.username,
+      u.display_name,
+      u.avatar_url,
+      u.leaderboard_hidden,
+      scoped."totalTokens" AS total_tokens,
+      scoped."totalCost" AS total_cost
+    FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+      AS scoped("userId" uuid, "totalTokens" numeric, "totalCost" numeric)
+    INNER JOIN users u ON scoped."userId" = u.id
+  `;
+}
+
 async function fetchAllTimeLeaderboardData(
   page: number,
   limit: number,
@@ -297,14 +367,6 @@ async function fetchAllTimeLeaderboardData(
   search: string,
 ): Promise<LeaderboardData> {
   const parsed = parseSearchDirectives(search);
-  const clientMatch = likeAny(sql`source`, parsed.clients);
-  const modelMatch = likeAny(sql`model`, parsed.models);
-  const sourceFilter = hasDirectives(parsed)
-    ? sql`
-    AND (${parsed.clients.length === 0} OR EXISTS (SELECT 1 FROM unnest(s.sources_used) AS source WHERE ${clientMatch}))
-    AND (${parsed.models.length === 0} OR EXISTS (SELECT 1 FROM unnest(s.models_used) AS model WHERE ${modelMatch}))
-  `
-    : sql``;
   const globalStatsBase = sql`
     SELECT s.user_id, u.username, u.display_name, u.avatar_url, u.leaderboard_hidden,
       SUM(s.total_tokens) AS total_tokens, SUM(CAST(s.total_cost AS DECIMAL(18,4))) AS total_cost
@@ -312,14 +374,16 @@ async function fetchAllTimeLeaderboardData(
     INNER JOIN users u ON s.user_id = u.id
     GROUP BY s.user_id, u.username, u.display_name, u.avatar_url, u.leaderboard_hidden
   `;
-  const base = sql`
-    SELECT s.user_id, u.username, u.display_name, u.avatar_url, u.leaderboard_hidden,
-      SUM(s.total_tokens) AS total_tokens, SUM(CAST(s.total_cost AS DECIMAL(18,4))) AS total_cost
-    FROM submissions s
-    INNER JOIN users u ON s.user_id = u.id
-    WHERE TRUE ${sourceFilter}
-    GROUP BY s.user_id, u.username, u.display_name, u.avatar_url, u.leaderboard_hidden
-  `;
+  let base = globalStatsBase;
+
+  if (hasDirectives(parsed)) {
+    const clients = normalizeDirectiveValues(parsed.clients);
+    const models = normalizeDirectiveValues(parsed.models);
+    const scopedPayload = await getCachedScopedAllTimeAggregate(clients, models);
+    base = scopedPayload.kind === "rows"
+      ? scopedAllTimeCachedBase(scopedPayload.rows)
+      : scopedAllTimeDirectBase(clients, models);
+  }
   const result = await db.execute<LeaderboardQueryResult>(
     resultQuery(
       base,
@@ -341,8 +405,7 @@ async function fetchLeaderboardData(
   limit: number,
   sortBy: SortBy,
   search: string,
-  customFrom?: string,
-  customTo?: string,
+  range: ReportDateRange | null,
 ): Promise<LeaderboardData> {
   return period === "all"
     ? fetchAllTimeLeaderboardData(page, limit, sortBy, search)
@@ -352,8 +415,7 @@ async function fetchLeaderboardData(
         limit,
         sortBy,
         search,
-        customFrom,
-        customTo,
+        range,
       );
 }
 
@@ -366,6 +428,8 @@ export function getLeaderboardData(
   customFrom?: string,
   customTo?: string,
 ): Promise<LeaderboardData> {
+  const range = getLeaderboardDateRange(period, new Date(), customFrom, customTo);
+  const rangeKey = range ? `${range.start}:${range.end}` : "all";
   const cacheKey =
     period === "custom"
       ? `leaderboard:custom:${customFrom}:${customTo}:${page}:${limit}:${sortBy}:${search}`
@@ -378,10 +442,9 @@ export function getLeaderboardData(
         limit,
         sortBy,
         search,
-        customFrom,
-        customTo,
+        range,
       ),
-    [cacheKey],
+    [cacheKey, rangeKey],
     { tags: ["leaderboard", `leaderboard:${period}`], revalidate: 300 },
   )();
 }
@@ -390,11 +453,9 @@ async function fetchUserRank(
   username: string,
   period: Period,
   sortBy: SortBy,
-  customFrom?: string,
-  customTo?: string,
+  range: ReportDateRange | null,
 ): Promise<LeaderboardUser | null> {
   if (period !== "all") {
-    const range = getPeriodDateRange(period, new Date(), customFrom, customTo);
     if (!range) return null;
     const base = sql`
       SELECT s.user_id, u.username, u.display_name, u.avatar_url, u.leaderboard_hidden,
@@ -444,12 +505,14 @@ export function getUserRank(
   customFrom?: string,
   customTo?: string,
 ): Promise<LeaderboardUser | null> {
+  const range = getLeaderboardDateRange(period, new Date(), customFrom, customTo);
+  const rangeKey = range ? `${range.start}:${range.end}` : "all";
   const usernameCacheKey = normalizeUsernameCacheKey(username);
   const periodKey =
     period === "custom" ? `custom:${customFrom}:${customTo}` : period;
   return unstable_cache(
-    () => fetchUserRank(username, period, sortBy, customFrom, customTo),
-    [`user-rank:${usernameCacheKey}:${periodKey}:${sortBy}`],
+    () => fetchUserRank(username, period, sortBy, range),
+    [`user-rank:${usernameCacheKey}:${periodKey}:${sortBy}`, rangeKey],
     {
       tags: ["leaderboard", "user-rank", `user-rank:${usernameCacheKey}`],
       revalidate: 300,

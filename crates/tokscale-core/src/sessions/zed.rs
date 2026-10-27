@@ -161,6 +161,10 @@ fn parse_thread_row(db_path: &Path, row: ZedThreadRow) -> Option<UnifiedMessage>
         tokens,
         0.0,
         Some(format!("zed:{}", row.id)),
+    )
+    .with_billing(
+        Some(ZED_HOSTED_PROVIDER),
+        super::BillingIdentityOrigin::KnownHostedChannel,
     );
     message.message_count = message_count;
 
@@ -256,6 +260,7 @@ fn token_usage_from_value(value: &Value) -> Option<TokenBreakdown> {
         output: usage_field(value, "output_tokens"),
         cache_read: usage_field(value, "cache_read_input_tokens"),
         cache_write: usage_field(value, "cache_creation_input_tokens"),
+        cache_write_1h: 0,
         reasoning: 0,
     })
 }

@@ -21,7 +21,7 @@ use super::data::{
 
 /// Cache staleness threshold: 5 minutes (matches TS implementation)
 const CACHE_STALE_THRESHOLD_MS: u64 = 5 * 60 * 1000;
-const CACHE_SCHEMA_VERSION: u32 = 10;
+const CACHE_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +97,10 @@ struct CachedTUIData {
     /// matches a real generation, so those are rebuilt once.
     #[serde(default)]
     parser_generation: u64,
+    /// Exact non-parser input that can change Codex archive results while the
+    /// parser implementation stays the same. Zero makes pre-field caches miss.
+    #[serde(default)]
+    codex_max_decoded_bytes: u64,
     timestamp: u64,
     enabled_clients: Vec<String>,
     #[serde(default)]
@@ -120,6 +124,8 @@ struct CachedUsageData {
     hourly: Vec<CachedHourlyUsage>,
     graph: Option<CachedGraphData>,
     total_tokens: u64,
+    #[serde(default)]
+    undated_tokens: u64,
     total_cost: f64,
     current_streak: u32,
     longest_streak: u32,
@@ -147,11 +153,15 @@ struct CachedModelUsage {
     workspace_key: Option<String>,
     #[serde(default)]
     workspace_label: Option<String>,
+    #[serde(default)]
+    machine: Option<String>,
     tokens: CachedTokenBreakdown,
     cost: f64,
     #[serde(default)]
     performance: ModelPerformance,
     session_count: u32,
+    #[serde(default)]
+    group_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +189,8 @@ struct CachedDailyModelInfo {
     cost: f64,
     #[serde(default)]
     messages: u64,
+    #[serde(default)]
+    performance: ModelPerformance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,10 +294,12 @@ impl From<&ModelUsage> for CachedModelUsage {
             client: m.client.clone(),
             workspace_key: m.workspace_key.clone(),
             workspace_label: m.workspace_label.clone(),
+            machine: m.machine.clone(),
             tokens: (&m.tokens).into(),
             cost: m.cost,
             performance: m.performance.clone(),
             session_count: m.session_count,
+            group_key: m.group_key.clone(),
         }
     }
 }
@@ -304,10 +318,13 @@ impl From<CachedModelUsage> for ModelUsage {
             client: m.client,
             workspace_key: m.workspace_key,
             workspace_label: m.workspace_label,
+            machine: m.machine,
             tokens: m.tokens.into(),
             cost: m.cost,
             performance: m.performance,
             session_count: m.session_count,
+            group_key: m.group_key,
+            daily: Vec::new(),
         }
     }
 }
@@ -346,6 +363,7 @@ impl From<&DailyModelInfo> for CachedDailyModelInfo {
             tokens: (&d.tokens).into(),
             cost: d.cost,
             messages: d.messages,
+            performance: d.performance.clone(),
         }
     }
 }
@@ -372,6 +390,7 @@ fn daily_model_info_from_cached(key: &str, value: CachedDailyModelInfo) -> Daily
         tokens: value.tokens.into(),
         cost: value.cost,
         messages: value.messages,
+        performance: value.performance,
     }
 }
 
@@ -630,6 +649,7 @@ impl From<&UsageData> for CachedUsageData {
             hourly: u.hourly.iter().map(|h| h.into()).collect(),
             graph: u.graph.as_ref().map(|g| g.into()),
             total_tokens: u.total_tokens,
+            undated_tokens: u.undated_tokens,
             total_cost: u.total_cost,
             current_streak: u.current_streak,
             longest_streak: u.longest_streak,
@@ -660,14 +680,18 @@ impl TryFrom<CachedUsageData> for UsageData {
             monthly,
             // Sessions are recomputed on each load (high cardinality, not
             // worth round-tripping through the on-disk cache); the first
-            // foreground refresh after cache hit will populate it.
+            // foreground refresh after cache hit will populate it. The
+            // subagent-rolled variant is derived in the same aggregation
+            // pass, so it is excluded here too.
             sessions: Vec::new(),
             // Projects follow the sessions/minutely precedent: recomputed on
             // each load so the cache schema does not need a version bump; the
             // first background refresh after cache hit will populate them.
             projects: Vec::new(),
+            sessions_rolled: Vec::new(),
             graph: graph.transpose()?,
             total_tokens: u.total_tokens,
+            undated_tokens: u.undated_tokens,
             total_cost: u.total_cost,
             loading: false,
             error: None,
@@ -797,7 +821,10 @@ fn classify_cached_payload(
     // `decide_initial_data` paints `Stale` exactly like `Fresh` -- so treating a
     // parser change as merely stale would show the pre-fix totals anyway, which
     // is the whole thing this guards against.
-    if cached.parser_generation != tokscale_core::parser_generation() {
+    if cached.parser_generation != tokscale_core::parser_generation()
+        || cached.codex_max_decoded_bytes
+            != tokscale_core::sessions::codex::max_codex_archive_bytes()
+    {
         return CacheResult::Miss;
     }
     let schema_outdated = cached.schema_version < CACHE_SCHEMA_VERSION;
@@ -965,6 +992,7 @@ pub fn save_cached_data(
     let cached = CachedTUIData {
         schema_version: CACHE_SCHEMA_VERSION,
         parser_generation: tokscale_core::parser_generation(),
+        codex_max_decoded_bytes: tokscale_core::sessions::codex::max_codex_archive_bytes(),
         timestamp,
         enabled_clients: clients_vec,
         include_synthetic,
@@ -1018,6 +1046,8 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_str(json).expect("fixture is valid JSON");
         value["parserGeneration"] = serde_json::json!(tokscale_core::parser_generation());
+        value["codexMaxDecodedBytes"] =
+            serde_json::json!(tokscale_core::sessions::codex::max_codex_archive_bytes());
         value.to_string()
     }
     use super::*;
@@ -1291,6 +1321,63 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_from_a_different_codex_archive_limit_misses() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&with_current_generation(LEGACY_FALLBACK_PAYLOAD)).unwrap();
+        let current = tokscale_core::sessions::codex::max_codex_archive_bytes();
+        value["codexMaxDecodedBytes"] = serde_json::json!(current.wrapping_sub(1));
+
+        let payload: CachedTUIData = serde_json::from_value(value).unwrap();
+        let clients = make_filters(&[ClientFilter::Claude], false);
+        let result = classify_cached_payload(
+            payload,
+            &clients,
+            &GroupBy::Model,
+            &CacheReportScope::default(),
+        );
+        assert!(
+            matches!(result, CacheResult::Miss),
+            "a cache built under a different Codex archive limit must miss; got {}",
+            other_variant_name(&result)
+        );
+    }
+
+    #[test]
+    fn a_cache_from_the_previous_claude_desktop_generation_misses() {
+        // Fixed value emitted by the first Desktop implementation (b161de41),
+        // before fdf7e4d0 changed its suffix from 1 to 2 to preserve full
+        // request identities. Deriving this from the current generation would
+        // let the test pass even if that invalidation bump were removed.
+        const PREVIOUS_DESKTOP_GENERATION: u64 = 3_619_169_160_637_170_511;
+        let mut value: serde_json::Value = serde_json::from_str(LEGACY_FALLBACK_PAYLOAD).unwrap();
+        value["parserGeneration"] = serde_json::json!(PREVIOUS_DESKTOP_GENERATION);
+        value["codexMaxDecodedBytes"] =
+            serde_json::json!(tokscale_core::sessions::codex::max_codex_archive_bytes());
+        let clients = make_filters(&[ClientFilter::Claude], false);
+        let scope = CacheReportScope::default();
+
+        let previous: CachedTUIData = serde_json::from_value(value.clone()).unwrap();
+        let result = classify_cached_payload(previous, &clients, &GroupBy::Model, &scope);
+        assert!(
+            matches!(result, CacheResult::Miss),
+            "the pre-fix Desktop aggregate must rebuild, not paint old totals; got {}",
+            other_variant_name(&result)
+        );
+
+        // The same payload is otherwise valid: changing only its generation
+        // to the current value must admit it. This prevents an unrelated
+        // schema, scope or client mismatch from making the regression pass.
+        value["parserGeneration"] = serde_json::json!(tokscale_core::parser_generation());
+        let current: CachedTUIData = serde_json::from_value(value).unwrap();
+        let result = classify_cached_payload(current, &clients, &GroupBy::Model, &scope);
+        assert!(
+            matches!(result, CacheResult::Fresh(_)),
+            "the generation-only control must be Fresh; got {}",
+            other_variant_name(&result)
+        );
+    }
+
+    #[test]
     fn a_cache_written_before_the_generation_field_misses() {
         // Migration path. Files written before the field existed deserialize to
         // 0, which no real generation equals, so they rebuild once on their own
@@ -1338,7 +1425,7 @@ mod tests {
             &cache_path,
             with_current_generation(
                 r#"{
-  "schemaVersion": 10,
+  "schemaVersion": 12,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,
@@ -1617,7 +1704,7 @@ mod tests {
             &cache_path,
             with_current_generation(
                 r#"{
-  "schemaVersion": 10,
+  "schemaVersion": 12,
   "timestamp": 9999999999999,
   "enabledClients": ["claude", "cursor"],
   "includeSynthetic": false,
@@ -1866,7 +1953,7 @@ mod tests {
     }
 
     const LEGACY_FALLBACK_PAYLOAD: &str = r#"{
-  "schemaVersion": 10,
+  "schemaVersion": 12,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,
@@ -2146,5 +2233,29 @@ mod tests {
             "expected Miss when reader uses TUI_DEFAULT_GROUP_BY and writer used GroupBy::default(), got {}",
             other_variant_name(&result)
         );
+    }
+
+    #[test]
+    fn daily_model_performance_survives_cache_round_trip() {
+        let original = DailyModelInfo {
+            provider: "anthropic".to_string(),
+            display_name: "claude-sonnet-4-5".to_string(),
+            color_key: "claude-sonnet-4-5".to_string(),
+            tokens: TokenBreakdown {
+                input: 100,
+                output: 50,
+                ..TokenBreakdown::default()
+            },
+            cost: 1.5,
+            messages: 2,
+            performance: ModelPerformance::from_totals(300, 150, 2),
+        };
+
+        let json = serde_json::to_string(&CachedDailyModelInfo::from(&original)).unwrap();
+        let restored =
+            daily_model_info_from_cached("claude-sonnet-4-5", serde_json::from_str(&json).unwrap());
+
+        assert_eq!(restored.performance, original.performance);
+        assert_eq!(restored.performance.ms_per_1k_tokens, Some(2000.0));
     }
 }

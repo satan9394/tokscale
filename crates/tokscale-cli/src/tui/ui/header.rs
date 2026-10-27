@@ -2,7 +2,6 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Tabs};
 
 use crate::tui::app::{App, ClickAction, Tab};
-use crate::tui::ui::widgets::AMBIENT_STABLE_BORDER_SET;
 
 const TAB_PADDING_LEFT_WIDTH: u16 = 1;
 const TAB_PADDING_RIGHT_WIDTH: u16 = 1;
@@ -17,10 +16,11 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .filter(|t| app.is_tab_visible(*t))
         .collect();
 
+    let lang = app.settings.tui_language;
     let titles: Vec<Line> = visible_tabs
         .iter()
         .map(|t| {
-            let name = tab_label(*t, is_very_narrow);
+            let name = tab_label(*t, is_very_narrow, lang);
             let style = if *t == app.current_tab {
                 Style::default()
                     .fg(app.theme.accent)
@@ -41,7 +41,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_set(AMBIENT_STABLE_BORDER_SET)
+        .border_set(app.glyphs.border)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " tokscale ",
@@ -55,7 +55,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     if !is_narrow {
         block = block.title_top(
             Line::from(vec![
-                Span::styled(" | ", app.theme.subtle_text_style()),
+                Span::styled(app.glyphs.tab_divider, app.theme.subtle_text_style()),
                 Span::styled("GitHub ", app.theme.subtle_text_style()),
             ])
             .right_aligned(),
@@ -70,7 +70,10 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 .fg(app.theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
-        .divider(Span::styled(" | ", Style::default().fg(app.theme.border)));
+        .divider(Span::styled(
+            app.glyphs.tab_divider,
+            Style::default().fg(app.theme.border),
+        ));
 
     frame.render_widget(tabs, area);
 
@@ -102,7 +105,8 @@ fn register_tab_click_areas(app: &mut App, area: Rect) {
 
         let left_padding_width = TAB_PADDING_LEFT_WIDTH.min(remaining_width);
         let remaining_width = remaining_width.saturating_sub(left_padding_width);
-        let title_width = tab_label_width(tab, is_very_narrow).min(remaining_width);
+        let title_width =
+            tab_label_width(tab, is_very_narrow, app.settings.tui_language).min(remaining_width);
         let remaining_width = remaining_width.saturating_sub(title_width);
         let right_padding_width = TAB_PADDING_RIGHT_WIDTH.min(remaining_width);
         let click_width = left_padding_width + title_width + right_padding_width;
@@ -119,16 +123,16 @@ fn register_tab_click_areas(app: &mut App, area: Rect) {
     }
 }
 
-fn tab_label(tab: Tab, is_very_narrow: bool) -> &'static str {
+fn tab_label(tab: Tab, is_very_narrow: bool, lang: crate::tui::i18n::TuiLanguage) -> &'static str {
     if is_very_narrow {
-        tab.short_name()
+        tab.localized_short_name(lang)
     } else {
-        tab.as_str()
+        tab.localized_name(lang)
     }
 }
 
-fn tab_label_width(tab: Tab, is_very_narrow: bool) -> u16 {
-    Line::from(tab_label(tab, is_very_narrow)).width() as u16
+fn tab_label_width(tab: Tab, is_very_narrow: bool, lang: crate::tui::i18n::TuiLanguage) -> u16 {
+    Line::from(tab_label(tab, is_very_narrow, lang)).width() as u16
 }
 
 #[cfg(test)]
@@ -153,6 +157,7 @@ mod tests {
             ..Default::default()
         };
         let mut app = App::new_with_cached_data(config, None).unwrap();
+        app.settings.tui_language = crate::tui::i18n::TuiLanguage::En;
         app.terminal_width = width;
         app
     }

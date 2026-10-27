@@ -498,16 +498,24 @@ mod tests {
                 output: 50,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             cost: 0.01,
             cost_source: Default::default(),
+            service_tier: None,
             message_count: 1,
             agent: None,
             dedup_key: None,
             session_title: None,
+            parent_session_id: None,
             is_turn_start: false,
             model_attribution_conflicted: false,
+            billing_identity: crate::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: crate::sessions::EstimateStatus::Unpriced,
+            copilot_context: None,
+            machine_label: None,
             duration_ms: None,
         }
     }
@@ -553,6 +561,7 @@ mod tests {
                 output: 0,
                 cache_read: i64::MAX,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             };
             message

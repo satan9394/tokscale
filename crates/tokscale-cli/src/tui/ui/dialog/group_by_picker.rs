@@ -13,7 +13,7 @@ use ratatui::{
 use tokscale_core::GroupBy;
 
 use crate::tui::themes::Theme;
-use crate::tui::ui::widgets::AMBIENT_STABLE_BORDER_SET;
+use crate::ui_glyphs::Glyphs;
 
 use super::{DialogContent, DialogResult};
 
@@ -22,6 +22,7 @@ pub struct GroupByPickerDialog {
     selected: Rc<RefCell<GroupBy>>,
     needs_reload: Rc<RefCell<bool>>,
     cursor: usize,
+    lang: crate::tui::i18n::TuiLanguage,
 }
 
 struct GroupByOption {
@@ -31,38 +32,48 @@ struct GroupByOption {
 }
 
 impl GroupByPickerDialog {
-    pub fn new(selected: Rc<RefCell<GroupBy>>, needs_reload: Rc<RefCell<bool>>) -> Self {
+    pub fn new(
+        selected: Rc<RefCell<GroupBy>>,
+        needs_reload: Rc<RefCell<bool>>,
+        lang: crate::tui::i18n::TuiLanguage,
+    ) -> Self {
+        use crate::tui::i18n::{tr, MessageKey};
         let current = selected.borrow().clone();
         let options = vec![
             GroupByOption {
                 value: GroupBy::Model,
-                label: "Model",
-                description: "One row per model (merge clients & providers)",
+                label: tr(lang, MessageKey::GroupByModelLabel),
+                description: tr(lang, MessageKey::GroupByModelDesc),
             },
             GroupByOption {
                 value: GroupBy::ClientModel,
-                label: "Client + Model",
-                description: "One row per client-model pair (default)",
+                label: tr(lang, MessageKey::GroupByClientModelLabel),
+                description: tr(lang, MessageKey::GroupByClientModelDesc),
             },
             GroupByOption {
                 value: GroupBy::ClientProviderModel,
-                label: "Client + Provider + Model",
-                description: "Most granular — no merging",
+                label: tr(lang, MessageKey::GroupByClientProviderModelLabel),
+                description: tr(lang, MessageKey::GroupByClientProviderModelDesc),
             },
             GroupByOption {
                 value: GroupBy::WorkspaceModel,
-                label: "Workspace + Model",
-                description: "Group local usage by workspace key, then model",
+                label: tr(lang, MessageKey::GroupByWorkspaceModelLabel),
+                description: tr(lang, MessageKey::GroupByWorkspaceModelDesc),
             },
             GroupByOption {
                 value: GroupBy::Session,
-                label: "Session + Model",
-                description: "One row per session_id and model (attribute cost per session)",
+                label: tr(lang, MessageKey::GroupBySessionLabel),
+                description: tr(lang, MessageKey::GroupBySessionDesc),
             },
             GroupByOption {
                 value: GroupBy::ClientSession,
-                label: "Client + Session + Model",
-                description: "One row per client, session_id, and model",
+                label: tr(lang, MessageKey::GroupByClientSessionLabel),
+                description: tr(lang, MessageKey::GroupByClientSessionDesc),
+            },
+            GroupByOption {
+                value: GroupBy::MachineModel,
+                label: tr(lang, MessageKey::GroupByMachineModelLabel),
+                description: tr(lang, MessageKey::GroupByMachineModelDesc),
             },
         ];
 
@@ -73,6 +84,7 @@ impl GroupByPickerDialog {
             selected,
             needs_reload,
             cursor,
+            lang,
         }
     }
 
@@ -88,20 +100,22 @@ impl GroupByPickerDialog {
 
 impl DialogContent for GroupByPickerDialog {
     fn desired_size(&self, viewport: Rect) -> (u16, u16) {
-        // 6 options render as 2 lines each (label + description) = 12 rows,
-        // plus header (1) + divider (1) + hint (1) + borders (2). Cap at 18
+        // 7 options render as 2 lines each (label + description) = 14 rows,
+        // plus header (1) + divider (1) + hint (1) + borders (2). Cap at 20
         // so every option stays visible without scrolling on a typical
-        // terminal; matches source_picker's sizing.
+        // terminal.
         let width = 52u16.min(viewport.width.saturating_sub(4));
-        let height = 18u16.min(viewport.height.saturating_sub(4));
+        let height = 20u16.min(viewport.height.saturating_sub(4));
         (width, height)
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme, glyphs: Glyphs) {
+        use crate::tui::i18n::{tr, tr_with_glyphs, MessageKey};
+        use unicode_width::UnicodeWidthStr;
         let block = Block::default()
-            .title(" Group By ")
+            .title(tr(self.lang, MessageKey::GroupByDialogTitle))
             .borders(Borders::ALL)
-            .border_set(AMBIENT_STABLE_BORDER_SET)
+            .border_set(glyphs.border)
             .border_style(Style::default().fg(theme.accent));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -117,9 +131,18 @@ impl DialogContent for GroupByPickerDialog {
             .split(inner);
 
         let current = self.selected.borrow();
+        let current_display = self
+            .options
+            .iter()
+            .find(|o| o.value == *current)
+            .map(|o| o.label.to_string())
+            .unwrap_or_else(|| current.to_string());
         let header = Paragraph::new(Line::from(vec![
-            Span::styled("Current: ", Style::default().fg(theme.muted)),
-            Span::styled(current.to_string(), Style::default().fg(theme.accent)),
+            Span::styled(
+                tr(self.lang, MessageKey::DialogCurrentLabel),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(current_display, Style::default().fg(theme.accent)),
         ]));
         frame.render_widget(header, rows[0]);
 
@@ -134,7 +157,11 @@ impl DialogContent for GroupByPickerDialog {
             let is_cursor = i == self.cursor;
             let is_active = *current == opt.value;
 
-            let radio = if is_active { "(●)" } else { "( )" };
+            let radio = if is_active {
+                glyphs.selected_radio
+            } else {
+                "( )"
+            };
             let usable = list_area.width.saturating_sub(4) as usize;
             let left = format!("{} {}", radio, opt.label);
             let desc = format!("    {}", opt.description);
@@ -156,13 +183,13 @@ impl DialogContent for GroupByPickerDialog {
                 Style::default().fg(theme.muted)
             };
 
-            let padding = usable.saturating_sub(left.chars().count());
+            let padding = usable.saturating_sub(UnicodeWidthStr::width(left.as_str()));
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(format!("  {}", left), base_style),
                 Span::styled(" ".repeat(padding), base_style),
             ])));
 
-            let desc_padding = usable.saturating_sub(desc.chars().count());
+            let desc_padding = usable.saturating_sub(UnicodeWidthStr::width(desc.as_str()));
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(format!("  {}", desc), desc_style),
                 Span::styled(" ".repeat(desc_padding), desc_style),
@@ -171,9 +198,13 @@ impl DialogContent for GroupByPickerDialog {
 
         frame.render_widget(List::new(items), list_area);
 
-        let hint = Paragraph::new("↑↓ navigate • Enter select • Esc close")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(theme.muted));
+        let hint = Paragraph::new(tr_with_glyphs(
+            self.lang,
+            MessageKey::GroupByDialogHint,
+            glyphs,
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(theme.muted));
         frame.render_widget(hint, rows[3]);
     }
 
@@ -198,5 +229,59 @@ impl DialogContent for GroupByPickerDialog {
             }
             _ => DialogResult::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::i18n::TuiLanguage;
+
+    fn picker(current: GroupBy) -> GroupByPickerDialog {
+        GroupByPickerDialog::new(
+            Rc::new(RefCell::new(current)),
+            Rc::new(RefCell::new(false)),
+            TuiLanguage::En,
+        )
+    }
+
+    #[test]
+    fn picker_offers_machine_and_model() {
+        let dialog = picker(GroupBy::Model);
+        let option = dialog
+            .options
+            .iter()
+            .find(|option| option.value == GroupBy::MachineModel)
+            .expect("machine,model is offered");
+        assert_eq!(option.label, "Machine + Model");
+    }
+
+    #[test]
+    fn choosing_machine_and_model_requests_a_reload() {
+        let selected = Rc::new(RefCell::new(GroupBy::Model));
+        let needs_reload = Rc::new(RefCell::new(false));
+        let mut dialog =
+            GroupByPickerDialog::new(selected.clone(), needs_reload.clone(), TuiLanguage::En);
+        dialog.cursor = dialog
+            .options
+            .iter()
+            .position(|option| option.value == GroupBy::MachineModel)
+            .unwrap();
+        dialog.select_current();
+        assert_eq!(*selected.borrow(), GroupBy::MachineModel);
+        assert!(*needs_reload.borrow());
+    }
+
+    #[test]
+    fn every_option_fits_the_dialog_height() {
+        let dialog = picker(GroupBy::MachineModel);
+        let (_, height) = dialog.desired_size(Rect::new(0, 0, 200, 60));
+        // Two lines per option, plus header, divider, hint and borders.
+        assert!(height as usize >= dialog.options.len() * 2 + 5);
+        assert_eq!(
+            dialog.cursor,
+            dialog.options.len() - 1,
+            "the cursor starts on the active grouping"
+        );
     }
 }

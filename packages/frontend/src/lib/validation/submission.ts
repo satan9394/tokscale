@@ -47,6 +47,17 @@ const TokenBreakdownSchema = z.object({
   reasoning: NonNegativeIntegerSchema,
 });
 
+const RecountProofCellSchema = z.object({
+  tokens: TokenBreakdownSchema,
+  cost: NonNegativeNumberSchema,
+  messages: NonNegativeIntegerSchema,
+});
+
+const RecountProofEntrySchema = z.object({
+  previous: RecountProofCellSchema,
+  corrected: RecountProofCellSchema,
+});
+
 const ClientContributionProvenanceSchema = z.object({
   schemaVersion: NonNegativeIntegerSchema.min(1),
   messageCount: NonNegativeIntegerSchema,
@@ -240,10 +251,28 @@ const SubmissionDataSchema = z.preprocess(normalizeLegacySources, z.object({
   scanScope: z.object({
     parserVersions: z.record(SourceSchema, NonNegativeIntegerSchema.min(1)),
     fullHistory: z.boolean(),
+    // New CLIs declare completeness per client. Absence preserves the legacy
+    // meaning where `fullHistory` applies to every declared parser.
+    fullHistoryClients: z.array(SourceSchema).optional(),
     // Retained protocol metadata. The high-water cannot yet use it as proof
     // that local history was pruned.
     retentionFloors: z
       .record(SourceSchema, RetentionFloorSchema)
+      .optional(),
+    // Per-client, per-day, per-model evidence of what the previous parser
+    // generation counted on top of this snapshot from the same local rows.
+    // `previous - corrected` is the over-count the receiver may subtract from
+    // a stored cell; a shape-valid entry whose numbers disagree with the
+    // snapshot is rejected per day by the planner rather than failing the
+    // whole submission.
+    recountProofs: z
+      .record(
+        SourceSchema,
+        z.record(
+          z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+          z.record(z.string().min(1), RecountProofEntrySchema)
+        )
+      )
       .optional(),
   }).optional(),
   summary: DataSummarySchema,
@@ -438,7 +467,12 @@ export function validateSubmission(data: unknown): ValidationResult {
   }
 
   // 3b. Active days should match
-  const activeDays = submission.contributions.filter((d) => d.totals.tokens > 0).length;
+  const activeDays = submission.contributions.filter(
+    (d) =>
+      d.totals.tokens > 0 ||
+      d.totals.cost > 0 ||
+      (d.totals.messages ?? 0) > 0
+  ).length;
   if (activeDays !== submission.summary.activeDays) {
     warnings.push(
       `Active days mismatch: summary=${submission.summary.activeDays}, calculated=${activeDays}`

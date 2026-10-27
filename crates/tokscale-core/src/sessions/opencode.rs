@@ -72,6 +72,7 @@ pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
     // Resolve model + provider before moving any fields out of `msg`, since
     // both borrow the whole struct to fall back onto the nested `model` object.
     let model_id = msg.resolve_model_id()?;
+    let billing_provider = msg.resolve_provider_id();
     let provider_id = msg
         .resolve_provider_id()
         .unwrap_or_else(|| "unknown".to_string());
@@ -110,10 +111,15 @@ pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
             output: tokens.output.max(0),
             cache_read: cache_read.max(0),
             cache_write: cache_write.max(0),
+            cache_write_1h: 0,
             reasoning: tokens.reasoning.unwrap_or(0).max(0),
         },
         cost,
         agent,
+    )
+    .with_billing(
+        billing_provider.as_deref(),
+        super::BillingIdentityOrigin::ExplicitRecord,
     );
     unified.duration_ms = time.completed.and_then(|completed| {
         let duration = completed - time.created;

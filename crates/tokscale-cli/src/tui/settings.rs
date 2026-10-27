@@ -3,12 +3,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokscale_core::scanner::ScannerSettings;
 
+use super::i18n::TuiLanguage;
 use super::themes::ThemeName;
 
 const DEFAULT_AUTO_REFRESH_MS: u64 = 60_000;
@@ -116,6 +117,39 @@ impl SettingsOrigin {
     }
 }
 
+/// Resolve the file an atomic rename must replace for `path`.
+///
+/// `rename(2)` replaces a symlink itself rather than the file it points at, so
+/// renaming onto a linked settings.json turns the link into a regular file. A
+/// link that is dangling, unreadable, or does not point at a regular file keeps
+/// the link path: there is no file to write through, and a rename at the link
+/// path is then the only write that can succeed.
+fn symlink_target(path: &Path) -> PathBuf {
+    let is_symlink = fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        return path.to_path_buf();
+    }
+    match fs::canonicalize(path) {
+        Ok(target) if fs::metadata(&target).map(|m| m.is_file()).unwrap_or(false) => target,
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Refuse a staged write when the link no longer resolves to the staged target.
+///
+/// The target is resolved before the temp file is staged, and the snapshot check
+/// compares contents only: a link retargeted at a file with identical contents
+/// would otherwise land the rename on the file the link used to point at, and
+/// leave the file it points at now stale.
+fn verify_target_unchanged(path: &Path, staged: &Path) -> Result<()> {
+    if symlink_target(path) != staged {
+        bail!("settings.json now resolves to a different file; refusing to replace it");
+    }
+    Ok(())
+}
+
 impl SettingsFileSnapshot {
     fn from_raw(raw: &RawSettings) -> Self {
         match raw {
@@ -149,6 +183,15 @@ impl ExplicitHomeConfigLayout {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GlyphMode {
+    #[default]
+    Auto,
+    Unicode,
+    Ascii,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LightSettings {
@@ -171,6 +214,25 @@ pub struct UsageSettings {
         deserialize_with = "deserialize_disabled_providers_string_array_lossy"
     )]
     pub disabled_providers: Vec<String>,
+}
+
+/// Cursor integration preferences (`"cursor": { ... }` in settings.json).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorSettings {
+    /// Overall wall-clock budget, in seconds, for an explicit
+    /// `tokscale cursor sync`. Unset keeps the default budget, which scales
+    /// with the event count Cursor reports. `--timeout` overrides it for one
+    /// run.
+    ///
+    /// Held as the raw JSON value, exactly as written. The sync uses it only
+    /// when it is a whole number in
+    /// `1..=crate::cursor::CURSOR_MAX_SYNC_TIMEOUT_SECS` and warns about
+    /// anything else (a string, a float, a negative or out-of-range number),
+    /// and keeping the raw value means a later settings save never erases a
+    /// hand edit the user still has to fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_timeout_seconds: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +315,11 @@ impl AutosubmitSettings {
 pub struct Settings {
     #[serde(default = "default_color_palette")]
     pub color_palette: String,
+    /// Glyph policy for app-owned TUI chrome. `Auto` uses terminal capability
+    /// detection; the explicit variants let users override an unknown or
+    /// incorrectly reported terminal width policy.
+    #[serde(default, deserialize_with = "deserialize_glyph_mode_lossy")]
+    pub glyphs: GlyphMode,
     #[serde(default)]
     pub auto_refresh_enabled: bool,
     #[serde(default = "default_auto_refresh_ms")]
@@ -307,9 +374,60 @@ pub struct Settings {
     #[serde(default)]
     pub model_aliases: tokscale_core::ModelAliasMap,
     /// When true, the interactive TUI uses a light background instead of the
-    /// hardcoded dark one. Toggled live with the `L` key and persisted.
-    #[serde(default)]
-    pub tui_light_mode: bool,
+    /// dark one. Toggled live with the `L` key and persisted. When unset, the
+    /// TUI follows the terminal background reported by `COLORFGBG`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui_light_mode: Option<bool>,
+    /// Preferred UI language for the TUI interface.
+    #[serde(default, deserialize_with = "deserialize_tui_language_lossy")]
+    pub tui_language: TuiLanguage,
+    /// Cursor integration preferences, e.g. the explicit sync budget.
+    #[serde(default, deserialize_with = "deserialize_cursor_settings_lossy")]
+    pub cursor: CursorSettings,
+}
+
+/// Lossy deserializer for `glyphs`: a typo or a non-string value falls back
+/// to auto-detection without invalidating unrelated settings.
+fn deserialize_glyph_mode_lossy<'de, D>(deserializer: D) -> Result<GlyphMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer).ok().flatten();
+    Ok(match value.as_ref().and_then(serde_json::Value::as_str) {
+        Some("unicode") => GlyphMode::Unicode,
+        Some("ascii") => GlyphMode::Ascii,
+        Some("auto") => GlyphMode::Auto,
+        _ => GlyphMode::Auto,
+    })
+}
+
+/// Lossy deserializer for the `cursor` section. Settings without a `cursor`
+/// key ignored a hand-edited `"cursor": "oops"`; failing the whole file on it
+/// now would read every other preference (scan paths, aliases, autosubmit) as
+/// its default on every run. A value that is not a `cursor` object reads as
+/// the default section instead.
+fn deserialize_cursor_settings_lossy<'de, D>(deserializer: D) -> Result<CursorSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer).ok().flatten();
+    Ok(value
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default())
+}
+
+/// Lossy deserializer for `tuiLanguage`: unrecognized language codes, hand-edited
+/// typos, or non-string values silently fall back to `TuiLanguage::En` (default)
+/// rather than failing Settings deserialization and discarding other preferences.
+fn deserialize_tui_language_lossy<'de, D>(deserializer: D) -> Result<TuiLanguage, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<serde_json::Value> = Option::deserialize(deserializer).ok().flatten();
+    match opt {
+        Some(serde_json::Value::String(s)) => Ok(TuiLanguage::from_code(&s).unwrap_or_default()),
+        _ => Ok(TuiLanguage::default()),
+    }
 }
 
 /// Lossy deserializer for `defaultClients`: accepts an array of arbitrary
@@ -368,6 +486,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             color_palette: default_color_palette(),
+            glyphs: GlyphMode::Auto,
             auto_refresh_enabled: false,
             auto_refresh_ms: DEFAULT_AUTO_REFRESH_MS,
             include_unused_models: false,
@@ -379,7 +498,9 @@ impl Default for Settings {
             minutely_tab_enabled: false,
             autosubmit: AutosubmitSettings::default(),
             model_aliases: tokscale_core::ModelAliasMap::default(),
-            tui_light_mode: false,
+            tui_light_mode: None,
+            tui_language: TuiLanguage::En,
+            cursor: CursorSettings::default(),
         }
     }
 }
@@ -691,6 +812,11 @@ impl Settings {
             .primary_path
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("could not resolve the tokscale settings location"))?;
+        // Rename onto the link target, not the link: dotfile managers (GNU Stow,
+        // chezmoi) keep settings.json as a symlink into a version-controlled
+        // checkout, and replacing the link with a regular file silently breaks
+        // that setup.
+        let write_path = symlink_target(path);
         // Coordinate Tokscale writers across the final comparison and rename.
         // A non-cooperating editor can still race an atomic rename, but any edit
         // present at this final check is rejected rather than overwritten.
@@ -710,20 +836,35 @@ impl Settings {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let tmp_filename = format!(".settings.{}.{:x}.tmp", std::process::id(), nanos);
-        let temp_path = path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join(&tmp_filename);
+        let staging_dir = write_path.parent().unwrap_or(std::path::Path::new("."));
+        let temp_path = staging_dir.join(&tmp_filename);
+        // A write routed through a link is staged in the target's directory,
+        // which can refuse it (read-only mount, store path, checkout owned by
+        // another user). Name that directory instead of surfacing a bare errno.
+        let write_through_link = write_path.as_path() != path;
 
         let write_result = (|| -> Result<()> {
-            let mut file = fs::File::create(&temp_path)?;
+            let mut file = fs::File::create(&temp_path).with_context(|| {
+                if write_through_link {
+                    format!(
+                        "could not stage a settings write in {}, the directory holding the file that {} links to",
+                        staging_dir.display(),
+                        path.display()
+                    )
+                } else {
+                    format!("could not create {}", temp_path.display())
+                }
+            })?;
             use std::io::Write;
             file.write_all(content.as_bytes())?;
             file.sync_all()?;
             // Check after staging and syncing: edits made during those slower
             // operations must leave the destination untouched as well.
             origin.verify_unchanged()?;
-            tokscale_core::fs_atomic::replace_file(&temp_path, path)?;
+            // The snapshot check compares contents; the link itself must still
+            // name the file the write was staged against.
+            verify_target_unchanged(path, &write_path)?;
+            tokscale_core::fs_atomic::replace_file(&temp_path, &write_path)?;
             Ok(())
         })();
 
@@ -968,6 +1109,51 @@ mod tests {
     }
 
     #[test]
+    fn settings_glyphs_defaults_to_auto_when_missing() {
+        let parsed: Settings = serde_json::from_str(r#"{"colorPalette":"blue"}"#).unwrap();
+        assert_eq!(parsed.glyphs, GlyphMode::Auto);
+    }
+
+    #[test]
+    fn settings_glyphs_accepts_each_persisted_mode() {
+        for (value, expected) in [
+            ("auto", GlyphMode::Auto),
+            ("unicode", GlyphMode::Unicode),
+            ("ascii", GlyphMode::Ascii),
+        ] {
+            let json = format!(r#"{{"glyphs":"{value}"}}"#);
+            let parsed: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.glyphs, expected);
+        }
+    }
+
+    #[test]
+    fn settings_glyphs_is_lossy_without_wiping_other_preferences() {
+        for malformed in [r#""wide""#, "17", "null", r#"{"mode":"ascii"}"#] {
+            let json = format!(
+                r#"{{"colorPalette":"halloween","glyphs":{malformed},"minutelyTabEnabled":true}}"#
+            );
+            let parsed: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.glyphs, GlyphMode::Auto);
+            assert_eq!(parsed.color_palette, "halloween");
+            assert!(parsed.minutely_tab_enabled);
+        }
+    }
+
+    #[test]
+    fn settings_glyphs_serializes_as_lowercase_string() {
+        let settings = Settings {
+            glyphs: GlyphMode::Ascii,
+            ..Settings::default()
+        };
+        let value = serde_json::to_value(settings).unwrap();
+        assert_eq!(
+            value.get("glyphs").and_then(|value| value.as_str()),
+            Some("ascii")
+        );
+    }
+
+    #[test]
     fn settings_load_backfills_scanner_when_missing_from_json() {
         // Older settings.json files predate the `scanner` key. They must
         // still deserialize cleanly and fall through to ScannerSettings::default.
@@ -1141,6 +1327,90 @@ mod tests {
     }
 
     #[test]
+    fn settings_round_trips_scanner_machine_labels_through_json() {
+        let json = r#"{
+            "scanner": {
+                "machineLabels": {
+                    "/mirrors/steven": "steven",
+                    "D:\\Mirrors\\Kev": "kev"
+                },
+                "localMachineLabel": "blade"
+            }
+        }"#;
+        let parsed: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.scanner.machine_labels.get("/mirrors/steven"),
+            Some(&"steven".to_string())
+        );
+        assert_eq!(
+            parsed.scanner.machine_labels.get("D:\\Mirrors\\Kev"),
+            Some(&"kev".to_string())
+        );
+        assert_eq!(parsed.scanner.local_machine_label.as_deref(), Some("blade"));
+
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            serialized["scanner"]["machineLabels"]["/mirrors/steven"],
+            serde_json::json!("steven")
+        );
+        assert_eq!(
+            serialized["scanner"]["localMachineLabel"],
+            serde_json::json!("blade")
+        );
+        let round_trip: Settings = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            round_trip.scanner.machine_labels,
+            parsed.scanner.machine_labels
+        );
+        assert_eq!(
+            round_trip.scanner.local_machine_label,
+            parsed.scanner.local_machine_label
+        );
+    }
+
+    #[test]
+    fn settings_without_machine_labels_do_not_write_them() {
+        let serialized = serde_json::to_value(Settings::default()).unwrap();
+        assert!(serialized["scanner"].get("machineLabels").is_none());
+        assert!(serialized["scanner"].get("localMachineLabel").is_none());
+    }
+
+    #[test]
+    fn settings_malformed_machine_labels_do_not_wipe_other_fields() {
+        // A hand-edited typo in either key must not reset the scan paths, the
+        // other scanner keys, or the rest of the file.
+        let json = r#"{
+            "colorPalette": "custom",
+            "scanner": {
+                "extraScanPaths": { "codex": ["/mirrors/steven/.codex/sessions"] },
+                "machineLabels": ["oops"],
+                "localMachineLabel": 5
+            }
+        }"#;
+        let parsed: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.color_palette, "custom");
+        assert!(parsed.scanner.machine_labels.is_empty());
+        assert_eq!(parsed.scanner.local_machine_label, None);
+        assert_eq!(
+            parsed.scanner.extra_scan_paths["codex"],
+            vec![PathBuf::from("/mirrors/steven/.codex/sessions")]
+        );
+
+        // A non-string label drops only that entry.
+        let json = r#"{
+            "scanner": {
+                "machineLabels": { "/mirrors/steven": "steven", "/mirrors/kev": 7 }
+            }
+        }"#;
+        let parsed: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.scanner.machine_labels.len(), 1);
+        assert_eq!(
+            parsed.scanner.machine_labels.get("/mirrors/steven"),
+            Some(&"steven".to_string())
+        );
+    }
+
+    #[test]
     fn settings_default_clients_defaults_to_empty() {
         // Older settings.json files have no `defaultClients` key — they
         // must still parse and yield the "no defaults configured" state.
@@ -1219,6 +1489,89 @@ mod tests {
         let serialized = serde_json::to_string(&light).unwrap();
         let parsed: LightSettings = serde_json::from_str(&serialized).unwrap();
         assert!(parsed.write_cache);
+    }
+
+    #[test]
+    fn cursor_sync_timeout_setting_parses_and_defaults_to_unset() {
+        let parsed: Settings = serde_json::from_str(r#"{ "colorPalette": "blue" }"#).unwrap();
+        assert_eq!(parsed.cursor, CursorSettings::default());
+        assert_eq!(parsed.cursor.sync_timeout_seconds, None);
+
+        let parsed: Settings =
+            serde_json::from_str(r#"{ "cursor": { "syncTimeoutSeconds": 600 } }"#).unwrap();
+        assert_eq!(
+            parsed.cursor.sync_timeout_seconds,
+            Some(serde_json::json!(600))
+        );
+
+        // `null` is the same as leaving the key out.
+        let parsed: Settings =
+            serde_json::from_str(r#"{ "cursor": { "syncTimeoutSeconds": null } }"#).unwrap();
+        assert_eq!(parsed.cursor.sync_timeout_seconds, None);
+    }
+
+    #[test]
+    fn cursor_sync_timeout_setting_keeps_unusable_values_as_written() {
+        // The sync warns about these and uses its default budget, but the
+        // settings file keeps them, so no later save erases a hand edit.
+        for raw in [r#""600""#, "-5", "1.5", "true", "[]", "999999", "0"] {
+            let json = format!(
+                r#"{{ "colorPalette": "purple", "cursor": {{ "syncTimeoutSeconds": {raw} }} }}"#
+            );
+            let parsed: Settings = serde_json::from_str(&json)
+                .unwrap_or_else(|error| panic!("{raw} must not fail settings: {error}"));
+            let expected: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                parsed.cursor.sync_timeout_seconds,
+                Some(expected.clone()),
+                "{raw}"
+            );
+            assert_eq!(parsed.color_palette, "purple", "{raw}");
+
+            let saved = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(saved["cursor"]["syncTimeoutSeconds"], expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn non_object_cursor_section_keeps_every_other_preference() {
+        for raw in [r#""oops""#, "5", "[]", "true", "null"] {
+            let json = format!(
+                r#"{{ "colorPalette": "purple", "scanner": {{ "bucketTimezone": "Asia/Seoul" }}, "cursor": {raw} }}"#
+            );
+            let parsed: Settings = serde_json::from_str(&json)
+                .unwrap_or_else(|error| panic!("cursor = {raw} must not fail settings: {error}"));
+            assert_eq!(parsed.cursor, CursorSettings::default(), "{raw}");
+            assert_eq!(parsed.color_palette, "purple", "{raw}");
+            assert_eq!(
+                parsed.scanner.bucket_timezone.as_deref(),
+                Some("Asia/Seoul"),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_sync_timeout_setting_serializes_only_when_set() {
+        let unset = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(unset["cursor"], serde_json::json!({}));
+
+        let settings = Settings {
+            cursor: CursorSettings {
+                sync_timeout_seconds: Some(serde_json::json!(900)),
+            },
+            ..Settings::default()
+        };
+        let set = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            set["cursor"],
+            serde_json::json!({ "syncTimeoutSeconds": 900 })
+        );
+        let round_trip: Settings = serde_json::from_value(set).unwrap();
+        assert_eq!(
+            round_trip.cursor.sync_timeout_seconds,
+            Some(serde_json::json!(900))
+        );
     }
 
     #[test]
@@ -1362,6 +1715,91 @@ mod tests {
         assert_eq!(saved.color_palette, "green");
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn save_writes_through_a_symlinked_settings_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_dir = temp.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", &config_dir);
+
+        // Dotfile managers link settings.json into a version-controlled checkout.
+        // Saving must update the file behind the link, not replace the link.
+        let tracked = temp.path().join("settings.json");
+        fs::write(&tracked, r#"{"colorPalette":"blue"}"#).unwrap();
+        let path = config_dir.join("settings.json");
+        std::os::unix::fs::symlink(&tracked, &path).unwrap();
+
+        let (mut settings, origin) = Settings::load_with_origin();
+        settings.color_palette = "green".to_string();
+        settings.save_with_origin(origin).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "saving must keep settings.json a symlink"
+        );
+        let saved: Settings = serde_json::from_str(&fs::read_to_string(&tracked).unwrap()).unwrap();
+        assert_eq!(saved.color_palette, "green");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn save_replaces_a_dangling_settings_symlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_dir = temp.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let _config_dir = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", &config_dir);
+
+        // Nothing exists behind this link, so there is no file to write through.
+        // The save must still succeed, replacing the link rather than failing.
+        let path = config_dir.join("settings.json");
+        std::os::unix::fs::symlink(temp.path().join("checkout/settings.json"), &path).unwrap();
+
+        let (mut settings, origin) = Settings::load_with_origin();
+        settings.color_palette = "green".to_string();
+        settings.save_with_origin(origin).unwrap();
+
+        let saved: Settings = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.color_palette, "green");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_write_is_rejected_when_settings_json_is_relinked() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        let tracked = temp.path().join("tracked.json");
+        let other = temp.path().join("other.json");
+        fs::write(&tracked, r#"{"colorPalette":"blue"}"#).unwrap();
+        fs::write(&other, r#"{"colorPalette":"blue"}"#).unwrap();
+        std::os::unix::fs::symlink(&tracked, &path).unwrap();
+
+        // Staged while the link points at `tracked`.
+        let staged = symlink_target(&path);
+        verify_target_unchanged(&path, &staged).unwrap();
+
+        // A dotfile manager retargets the link before the rename. The two files
+        // hold identical contents, so the snapshot check cannot catch this.
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&other, &path).unwrap();
+        assert!(verify_target_unchanged(&path, &staged).is_err());
+
+        // Unpacking a regular file over the link is the same hazard.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, r#"{"colorPalette":"blue"}"#).unwrap();
+        assert!(verify_target_unchanged(&path, &staged).is_err());
+
+        // Without a link the staged target is the settings path itself.
+        let plain = temp.path().join("plain.json");
+        fs::write(&plain, "{}").unwrap();
+        verify_target_unchanged(&plain, &symlink_target(&plain)).unwrap();
+    }
+
     #[test]
     #[serial_test::serial]
     fn save_with_origin_refuses_to_replace_settings_changed_after_load() {
@@ -1418,5 +1856,49 @@ mod tests {
             .to_string()
             .contains("changed since it was loaded"));
         assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn test_tui_language_serialization_and_fallback() {
+        // Missing field defaults to English
+        let json = r#"{"colorPalette":"blue"}"#;
+        let parsed: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.tui_language, TuiLanguage::En);
+
+        // Explicit languages parse properly
+        let json_ko = r#"{"tuiLanguage":"ko"}"#;
+        let parsed: Settings = serde_json::from_str(json_ko).unwrap();
+        assert_eq!(parsed.tui_language, TuiLanguage::Ko);
+
+        let json_ja = r#"{"tuiLanguage":"ja"}"#;
+        let parsed: Settings = serde_json::from_str(json_ja).unwrap();
+        assert_eq!(parsed.tui_language, TuiLanguage::Ja);
+
+        let json_zh = r#"{"tuiLanguage":"zh-CN"}"#;
+        let parsed: Settings = serde_json::from_str(json_zh).unwrap();
+        assert_eq!(parsed.tui_language, TuiLanguage::ZhCn);
+
+        let json_fr = r#"{"tuiLanguage":"fr"}"#;
+        let parsed: Settings = serde_json::from_str(json_fr).unwrap();
+        assert_eq!(parsed.tui_language, TuiLanguage::Fr);
+
+        // Serialization outputs camelCase tuiLanguage with canonical code
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(serialized.contains(r#""tuiLanguage":"fr""#));
+
+        // Unknown / unrecognized values fall back to En safely without error
+        let json_invalid = r#"{"tuiLanguage":"es","colorPalette":"dark"}"#;
+        let parsed: Settings = serde_json::from_str(json_invalid).unwrap();
+        assert_eq!(parsed.tui_language, TuiLanguage::En);
+        assert_eq!(parsed.color_palette, "dark");
+
+        let json_num = r#"{"tuiLanguage":42}"#;
+        let parsed: Settings = serde_json::from_str(json_num).unwrap();
+        assert_eq!(parsed.tui_language, TuiLanguage::En);
+
+        // Case-insensitive & common alias formats recover correctly
+        let json_zh_alias = r#"{"tuiLanguage":"zh_cn"}"#;
+        let parsed: Settings = serde_json::from_str(json_zh_alias).unwrap();
+        assert_eq!(parsed.tui_language, TuiLanguage::ZhCn);
     }
 }

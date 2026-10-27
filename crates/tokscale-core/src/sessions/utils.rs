@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::SystemTime;
@@ -196,6 +196,20 @@ pub(crate) fn extract_i64(value: Option<&Value>) -> Option<i64> {
     })
 }
 
+/// Read `usage.cache_creation.ephemeral_1h_input_tokens` from a raw JSON
+/// `usage` block, for the `serde_json::Value` parsing path that never
+/// deserializes into [`AnthropicUsage`]. Clamped at zero, not yet against
+/// the usage block's `cache_creation_input_tokens` total.
+pub(crate) fn extract_cache_write_1h(usage: &Value) -> i64 {
+    extract_i64(
+        usage
+            .get("cache_creation")
+            .and_then(|creation| creation.get("ephemeral_1h_input_tokens")),
+    )
+    .unwrap_or(0)
+    .max(0)
+}
+
 pub(crate) fn extract_string(value: Option<&Value>) -> Option<String> {
     value.and_then(|val| val.as_str().map(|s| s.to_string()))
 }
@@ -295,6 +309,18 @@ pub(crate) fn open_readonly_sqlite(path: &Path) -> rusqlite::Result<Connection> 
 /// Returns `None` if the file cannot be opened — the caller treats that as "no sessions".
 pub(crate) fn open_readonly_sqlite_opt(path: &Path) -> Option<Connection> {
     open_readonly_sqlite(path).ok()
+}
+
+/// Open a read-only SQLite connection and begin one snapshot for every read it performs.
+///
+/// SQLite otherwise gives each completed statement its own implicit transaction,
+/// so a multi-statement parser can combine rows from commits that never existed
+/// together. A deferred transaction starts the snapshot on the first read and
+/// keeps it until the returned connection is dropped.
+pub(crate) fn open_readonly_sqlite_snapshot(path: &Path) -> Option<Connection> {
+    let conn = open_readonly_sqlite_opt(path)?;
+    conn.execute_batch("BEGIN DEFERRED").ok()?;
+    Some(conn)
 }
 
 /// Which stage of a [`sqlite_for_each_row`] scan the driver reached.
@@ -527,14 +553,85 @@ pub(crate) fn estimate_tokens(chars: usize) -> i64 {
     chars.div_ceil(4) as i64
 }
 
+/// Bounded limit for decompressing archived transcripts (.zst) into memory.
+pub(crate) const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// True when a path has a `.zst` file extension.
+pub(crate) fn is_zst_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zst"))
+}
+
+/// Stream non-blank trimmed lines from a zstd-compressed archive file with a bounded limit.
+/// Returns Ok(()) if the archive was completely read without error and did not exceed `max_bytes`.
+pub(crate) fn for_each_archive_line(
+    path: &Path,
+    max_bytes: u64,
+    mut sink: impl FnMut(usize, &str),
+) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut decoder = zstd::stream::read::Decoder::new(file)?;
+    decoder.window_log_max(26)?;
+    let mut reader = std::io::BufReader::new(decoder.take(max_bytes + 1));
+    let mut buf = Vec::new();
+    let mut at_start = true;
+    let mut index = 0usize;
+    let mut total_bytes = 0u64;
+
+    loop {
+        buf.clear();
+        let bytes_read = match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        };
+        total_bytes += bytes_read as u64;
+        if total_bytes > max_bytes {
+            return Err(std::io::Error::other(
+                "decoded transcript exceeds archive limit",
+            ));
+        }
+
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+
+        let bom = "\u{feff}".as_bytes();
+        let start = if std::mem::take(&mut at_start) && buf.starts_with(bom) {
+            bom.len()
+        } else {
+            0
+        };
+
+        let text = String::from_utf8_lossy(&buf[start..]);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            sink(index, trimmed);
+        }
+        index += 1;
+    }
+
+    Ok(())
+}
+
 /// Session id taken from a transcript file's stem, e.g.
 /// `.../ses_abc123.jsonl` -> `ses_abc123`.
+/// If the file is compressed (`.jsonl.zst`), the outer `.zst` is stripped first
+/// so the logical stem matches the uncompressed session name.
 ///
 /// Clients whose session id is not the file stem — or that treat a blank stem
 /// differently — keep their own resolver rather than calling this.
 pub(crate) fn session_id_from_path(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
+    let mut stem = path.file_stem();
+    if is_zst_path(path) {
+        if let Some(s) = stem {
+            stem = Path::new(s).file_stem();
+        }
+    }
+    stem.and_then(|stem| stem.to_str())
         .unwrap_or("unknown")
         .to_string()
 }
@@ -584,6 +681,14 @@ pub(crate) fn resolved_provider(
         .unwrap_or_else(|| fallback.to_string())
 }
 
+/// The nested `cache_creation` split Anthropic reports beside the summed
+/// `cache_creation_input_tokens`. Absent on transcripts recorded before the
+/// 1-hour TTL cache existed, and on any client that never asked for it.
+#[derive(Debug, Deserialize)]
+pub struct AnthropicCacheCreation {
+    pub ephemeral_1h_input_tokens: Option<i64>,
+}
+
 /// The Anthropic Messages API `usage` block in its snake_case wire spelling.
 ///
 /// Shared by the clients that persist Anthropic responses verbatim
@@ -602,19 +707,52 @@ pub struct AnthropicUsage {
     pub output_tokens: Option<i64>,
     pub cache_read_input_tokens: Option<i64>,
     pub cache_creation_input_tokens: Option<i64>,
+    pub cache_creation: Option<AnthropicCacheCreation>,
+    /// Optional server-side calls. Keep unknown shapes from invalidating totals;
+    /// Claude Code interprets only well-formed advisor iterations.
+    pub iterations: Option<serde_json::Value>,
 }
 
 impl AnthropicUsage {
+    /// Whether this usage object describes the prompt/caching split, rather than
+    /// being a bare snapshot of the whole prompt.
+    ///
+    /// Anthropic's own responses always carry both cache keys, so their
+    /// `input_tokens` is the uncached remainder and can be compared with another
+    /// entry's. Some third-party models behind Claude Code instead emit one
+    /// content block per response and omit the cache keys entirely; there
+    /// `input_tokens` is the whole prompt, so it is not comparable.
+    ///
+    /// Key presence is the signal, not the value: a short prompt that never
+    /// reached the cache minimum is reported as an explicit `0`, and that is
+    /// still a genuine split.
+    pub fn reports_cache_split(&self) -> bool {
+        self.cache_read_input_tokens.is_some() || self.cache_creation_input_tokens.is_some()
+    }
+
     /// Token breakdown with every field clamped at zero. This block carries no
     /// reasoning bucket, so `reasoning` is always 0.
     pub fn to_breakdown(&self) -> TokenBreakdown {
+        let cache_write = self.cache_creation_input_tokens.unwrap_or(0).max(0);
         TokenBreakdown {
             input: self.input_tokens.unwrap_or(0).max(0),
             output: self.output_tokens.unwrap_or(0).max(0),
             cache_read: self.cache_read_input_tokens.unwrap_or(0).max(0),
-            cache_write: self.cache_creation_input_tokens.unwrap_or(0).max(0),
+            cache_write,
+            cache_write_1h: self.cache_write_1h_raw().min(cache_write),
             reasoning: 0,
         }
+    }
+
+    /// The `ephemeral_1h_input_tokens` bucket, clamped at zero but not yet
+    /// against `cache_write`. Transcripts without the nested `cache_creation`
+    /// object report 0, matching today's behaviour.
+    pub fn cache_write_1h_raw(&self) -> i64 {
+        self.cache_creation
+            .as_ref()
+            .and_then(|creation| creation.ephemeral_1h_input_tokens)
+            .unwrap_or(0)
+            .max(0)
     }
 }
 
@@ -662,6 +800,7 @@ impl CamelUsage {
             output: self.output.unwrap_or(0).max(0),
             cache_read: self.cache_read.unwrap_or(0).max(0),
             cache_write: self.cache_write.unwrap_or(0).max(0),
+            cache_write_1h: 0,
             reasoning: 0,
         }
     }

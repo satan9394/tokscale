@@ -27,6 +27,7 @@ export const MONTH_LABELS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Ju
 
 // Source configuration
 export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
+  aside: "Aside",
   opencode: "OpenCode",
   claude: "Claude Code",
   codex: "Codex CLI",
@@ -52,6 +53,7 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   goose: "Goose",
   antigravity: "Antigravity",
   "antigravity-cli": "Antigravity CLI",
+  "antigravity-extension": "Antigravity IDE Extension",
   zed: "Zed Agent",
   trae: "Trae",
   warp: "Warp",
@@ -82,11 +84,16 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   lmstudio: "LM Studio",
   unsloth: "Unsloth",
   hindsight: "Hindsight",
+  "micode-desktop": "Xiaomi MiMo AI",
+  muse: "Muse Code",
+  vibe: "Mistral Vibe",
+  proma: "Proma",
 };
 
 // Client logos from GitHub CDN (public repo)
 const GITHUB_CDN_BASE = "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets";
 export const SOURCE_LOGOS: Record<ClientType, string> = {
+  aside: `${GITHUB_CDN_BASE}/client-aside.png`,
   opencode: `${GITHUB_CDN_BASE}/client-opencode.png`,
   claude: `${GITHUB_CDN_BASE}/client-claude.jpg`,
   codex: `${GITHUB_CDN_BASE}/client-openai.jpg`,
@@ -112,6 +119,7 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
   goose: `${GITHUB_CDN_BASE}/client-goose.png`,
   antigravity: `${GITHUB_CDN_BASE}/client-antigravity.png`,
   "antigravity-cli": `${GITHUB_CDN_BASE}/client-antigravity.png`,
+  "antigravity-extension": `${GITHUB_CDN_BASE}/client-antigravity.png`,
   zed: `${GITHUB_CDN_BASE}/client-zed.webp`,
   trae: `${GITHUB_CDN_BASE}/client-trae.png`,
   warp: "https://github.com/warpdotdev.png",
@@ -147,9 +155,15 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
   lmstudio: "https://github.com/lmstudio-ai.png",
   unsloth: "https://github.com/unslothai.png",
   hindsight: `${GITHUB_CDN_BASE}/client-hindsight.png`,
+  // Distinct desktop product icon (from Xiaomi MiMo AI.app Resources/icon.icns).
+  "micode-desktop": `${GITHUB_CDN_BASE}/client-micode-desktop.png`,
+  muse: "https://github.com/meta-models.png",
+  vibe: "https://github.com/mistralai.png",
+  proma: "https://raw.githubusercontent.com/proma-ai/Proma/86d9dfb511db4c1e3ffded3b6c3e312996f50cbf/apps/electron/resources/icon.png",
 };
 
 export const SOURCE_COLORS: Record<ClientType, string> = {
+  aside: "#64748B",
   opencode: "#00A8E8",
   claude: "#f97316",
   codex: "#10B981",
@@ -175,6 +189,7 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   goose: "#64B4DC",
   antigravity: "#6366F1",
   "antigravity-cli": "#6366F1",
+  "antigravity-extension": "#6366F1",
   zed: "#084CCF",
   trae: "#00BFA5",
   warp: "#01A4A4",
@@ -205,6 +220,10 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   lmstudio: "#6C5CE7",
   unsloth: "#58CC02",
   hindsight: "#0891B2",
+  "micode-desktop": "#FF6900",
+  muse: "#0064E0",
+  vibe: "#FA520F",
+  proma: "#6366F1",
 };
 
 // Derived values

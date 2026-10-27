@@ -138,23 +138,13 @@ impl PathRoot {
             }
             PathRoot::Config => {
                 if use_env_roots {
-                    if let Some(custom) = std::env::var_os("TOKSCALE_CONFIG_DIR") {
-                        if !custom.is_empty() {
-                            return custom.to_string_lossy().into_owned();
-                        }
-                    }
-
-                    #[cfg(target_os = "linux")]
-                    if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME") {
-                        return format!("{xdg_config_home}/tokscale");
-                    }
-
-                    // Match paths::get_config_dir() so default Windows scans
-                    // read the same %APPDATA% root used by cache writers.
-                    #[cfg(target_os = "windows")]
-                    if let Some(dir) = dirs::config_dir() {
-                        return dir.join("tokscale").to_string_lossy().into_owned();
-                    }
+                    // The cache writer uses this resolver. In particular, it
+                    // rejects empty config overrides and lets `dirs` ignore an
+                    // invalid XDG_CONFIG_HOME rather than scanning a different
+                    // relative/root path.
+                    return crate::paths::get_config_dir()
+                        .to_string_lossy()
+                        .into_owned();
                 }
 
                 #[cfg(target_os = "windows")]
@@ -432,7 +422,7 @@ define_clients!(
             fallback_relative: ".codex",
         },
         relative: "sessions",
-        pattern: "*.jsonl",
+        pattern: "*.jsonl*",
         headless: true,
         parse_local: true,
         submit_default: true
@@ -463,8 +453,8 @@ define_clients!(
     Amp = 5 => {
         id: "amp",
         display: "Amp",
-        logo: Some("https://tokscale.ai/assets/logos/amp.png"),root: PathRoot::XdgData,
-        relative: "amp/threads",
+        logo: Some("https://tokscale.ai/assets/logos/amp.png"),root: PathRoot::Config,
+        relative: "amp-cache/threads",
         pattern: "T-*.json",
         headless: false,
         parse_local: true,
@@ -1056,6 +1046,95 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Xiaomi MiMo AI (desktop) shares MiMo Code's engine and on-disk SQLite
+    // store. Sessions are split at parse time by `session.version` (desktop
+    // installs stamp a `desktop-` InstallationVersion); both clients therefore
+    // resolve the same XDG data directory so either filter still discovers
+    // the shared `mimocode*.db` files.
+    MiMoDesktop = 53 => {
+        id: "micode-desktop",
+        display: "Xiaomi MiMo AI",
+        logo: Some("https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-micode-desktop.png"),
+        root: PathRoot::XdgData,
+        relative: "mimocode",
+        pattern: "*.db",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    // Muse Code (Meta) persists one event-sourced `session.jsonl` per
+    // session under an XDG-style data dir on every platform, including
+    // Windows. Subagent transcripts live in `subagent/<uuid>/` beside the
+    // parent session and are picked up by the same recursive scan.
+    Muse = 54 => {
+        id: "muse",
+        display: "Muse Code",
+        logo: None,
+        root: PathRoot::XdgData,
+        relative: "muse/sessions",
+        pattern: "session.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    // Antigravity IDE Extensions (VS Code, JetBrains, Zed, and others) persist
+    // the same generation databases as the CLI under a separate application
+    // directory. Keep the client identity distinct for attribution; the
+    // Antigravity parser family removes repeated response IDs across surfaces.
+    AntigravityExtension = 55 => {
+        id: "antigravity-extension",
+        display: "Antigravity IDE Extension",
+        logo: Some("https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-antigravity.png"),
+        root: PathRoot::Home,
+        relative: ".gemini/antigravity/conversations",
+        pattern: "*.db",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Aside = 56 => {
+        id: "aside",
+        display: "Aside",
+        logo: Some("https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-aside.png"),
+        root: PathRoot::Home,
+        relative: ".aside/u",
+        // Documentation only: `scanner::scan_aside_accounts` owns this
+        // client's discovery and ignores the pattern, because the generic
+        // walker would both follow a transcript-shaped symlink out of the
+        // account tree and admit `messages.jsonl` at the wrong depth.
+        pattern: "messages.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    // Mistral Vibe: terminal coding agent by Mistral AI.
+    // Logs session metadata and message history under `~/.vibe/logs/session/`
+    // (configurable via VIBE_HOME).
+    Vibe = 57 => {
+        id: "vibe",
+        display: "Mistral Vibe",
+        logo: None,
+        root: PathRoot::EnvVar {
+            var: "VIBE_HOME",
+            fallback_relative: ".vibe",
+        },
+        relative: "logs/session",
+        pattern: "vibe-session",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Proma = 58 => {
+        id: "proma",
+        display: "Proma",
+        logo: Some("https://raw.githubusercontent.com/proma-ai/Proma/86d9dfb511db4c1e3ffded3b6c3e312996f50cbf/apps/electron/resources/icon.png"),
+        root: PathRoot::Home,
+        relative: ".proma",
+        pattern: "proma-session",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -1171,7 +1250,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 53);
+        assert_eq!(ClientId::COUNT, 59);
     }
 
     #[test]
@@ -1763,6 +1842,24 @@ mod tests {
     }
 
     #[test]
+    fn test_muse_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("muse").expect("muse client should be registered");
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            native_join(
+                std::path::Path::new("/tmp/home"),
+                ".local/share/muse/sessions"
+            )
+        );
+        assert_eq!(client.data().pattern, "session.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
     fn test_junie_client_registered_as_local_session_source() {
         let client = ClientId::from_str("junie").expect("junie client should be registered");
         assert_eq!(
@@ -1969,6 +2066,26 @@ mod tests {
 
         let resolved = PathRoot::Config.resolve("/tmp/home");
         assert_eq!(resolved, "/tmp/xdg-config-home/tokscale");
+
+        restore_env("TOKSCALE_CONFIG_DIR", previous_override);
+        restore_env("XDG_CONFIG_HOME", previous_xdg);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial]
+    fn test_path_root_config_matches_writer_for_empty_xdg_config_home() {
+        let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
+        let previous_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::remove_var("TOKSCALE_CONFIG_DIR");
+            std::env::set_var("XDG_CONFIG_HOME", "");
+        }
+
+        assert_eq!(
+            PathRoot::Config.resolve("/tmp/home"),
+            crate::paths::get_config_dir().to_string_lossy()
+        );
 
         restore_env("TOKSCALE_CONFIG_DIR", previous_override);
         restore_env("XDG_CONFIG_HOME", previous_xdg);
@@ -2249,6 +2366,31 @@ mod tests {
     #[test]
     fn test_antigravity_submit_default_is_true() {
         assert!(ClientId::Antigravity.submit_default());
+    }
+
+    #[test]
+    fn test_antigravity_extension_database_path() {
+        let client = ClientId::AntigravityExtension;
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            native_join(
+                std::path::Path::new("/tmp/home"),
+                ".gemini/antigravity/conversations"
+            )
+        );
+        assert_eq!(client.data().pattern, "*.db");
+        assert!(client.parse_local());
+        assert!(client.submit_default());
+    }
+
+    #[test]
+    fn test_vibe_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("vibe").expect("vibe client should be registered");
+        assert_eq!(client.data().relative_path, "logs/session");
+        assert_eq!(client.data().pattern, "vibe-session");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
     }
 
     #[test]
