@@ -8,6 +8,7 @@ mod device;
 mod hindsight;
 mod paths;
 mod process_liveness;
+mod submission_warnings;
 mod trae;
 mod tui;
 mod ui_glyphs;
@@ -1237,6 +1238,7 @@ pub enum ClientFilter {
     Aside,
     Vibe,
     Proma,
+    Bb,
     Synthetic,
 }
 
@@ -1306,6 +1308,7 @@ impl ClientFilter {
             Self::Aside => "aside",
             Self::Vibe => "vibe",
             Self::Proma => "proma",
+            Self::Bb => "bb",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1378,6 +1381,7 @@ impl ClientFilter {
             Self::Aside => Some(ClientId::Aside),
             Self::Vibe => Some(ClientId::Vibe),
             Self::Proma => Some(ClientId::Proma),
+            Self::Bb => Some(ClientId::Bb),
             Self::Synthetic => None,
         }
     }
@@ -1446,6 +1450,7 @@ impl ClientFilter {
             ClientId::Aside => Self::Aside,
             ClientId::Vibe => Self::Vibe,
             ClientId::Proma => Self::Proma,
+            ClientId::Bb => Self::Bb,
         }
     }
 
@@ -1639,15 +1644,8 @@ fn cursor_setup_state(home_dir: &Option<String>) -> Option<CursorSetupState> {
     } else {
         cursor::is_cursor_logged_in()
     };
-    let has_cache = cursor::has_cursor_usage_cache_in_home(&home_path);
-    let cache_glob = if home_override {
-        home_path
-            .join(".config/tokscale/cursor-cache/usage*.json")
-            .to_string_lossy()
-            .to_string()
-    } else {
-        "~/.config/tokscale/cursor-cache/usage*.json".to_string()
-    };
+    let has_cache = cursor::has_cursor_usage_cache_in_home(&home_path, !home_override);
+    let cache_glob = cursor::usage_cache_glob(&home_path, !home_override);
 
     Some(CursorSetupState {
         has_credentials,
@@ -2119,25 +2117,38 @@ impl LightSpinner {
     const FRAME_MS: u64 = 40;
 
     fn start(message: &'static str) -> Self {
+        Self::start_with_ready(message, None)
+    }
+
+    fn start_with_ready(message: &'static str, ready: Option<std::sync::mpsc::Sender<()>>) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
         let message = message.to_string();
 
         let handle = thread::spawn(move || {
             let mut frame = 0usize;
-            let mut stderr = io::stderr().lock();
-
-            let _ = write!(stderr, "\x1b[?25l");
-            let _ = stderr.flush();
+            let mut ready = ready;
+            {
+                let mut stderr = io::stderr().lock();
+                let _ = write!(stderr, "\x1b[?25l");
+                let _ = stderr.flush();
+            }
 
             while running_thread.load(Ordering::Relaxed) {
                 let spinner = Self::frame(frame);
-                let _ = write!(stderr, "\r\x1b[K  {} {}", spinner, message);
-                let _ = stderr.flush();
+                {
+                    let mut stderr = io::stderr().lock();
+                    let _ = write!(stderr, "\r\x1b[K  {} {}", spinner, message);
+                    let _ = stderr.flush();
+                }
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
                 frame = frame.wrapping_add(1);
                 thread::sleep(Duration::from_millis(Self::FRAME_MS));
             }
 
+            let mut stderr = io::stderr().lock();
             let _ = write!(stderr, "\r\x1b[K\x1b[?25h");
             let _ = stderr.flush();
         });
@@ -4024,6 +4035,9 @@ fn run_pricing_lookup(
                 if !row.coverage && !row.uncovered_buckets.is_empty() {
                     print!(" uncovered={}", row.uncovered_buckets.join(","));
                 }
+                if let Some(gap) = row.submission_safety_gap {
+                    print!(" submission_safety_gap={}", gap.as_str());
+                }
                 println!();
             }
         }
@@ -4773,6 +4787,18 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
                     exists: roots[1].exists(),
                 });
             }
+            if client == ClientId::Copilot {
+                let session_state = home_dir.join(".copilot/session-state");
+                additional_paths.push(AdditionalPath {
+                    path: session_state.to_string_lossy().to_string(),
+                    exists: session_state.exists(),
+                });
+                let session_store = home_dir.join(".copilot/session-store.db");
+                additional_paths.push(AdditionalPath {
+                    path: session_store.to_string_lossy().to_string(),
+                    exists: session_store.exists(),
+                });
+            }
             if client == ClientId::Zcode {
                 let path = home_dir.join(".zcode/cli/db/db.sqlite");
                 additional_paths.push(AdditionalPath {
@@ -5126,7 +5152,8 @@ fn describe_path_for_home(path: &str, exists: bool, home: &Path) -> String {
 }
 
 fn format_number(n: i32) -> String {
-    if n >= 1_000_000 {
+    // Switch to millions where `{:.1}` would round the thousands up to "1000.0K".
+    if n >= 999_950 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
         format!("{:.1}K", n as f64 / 1_000.0)
@@ -5336,6 +5363,11 @@ struct TsScanScope {
     parser_versions: std::collections::BTreeMap<String, u32>,
     full_history: bool,
     full_history_clients: Vec<String>,
+    /// Clients a date-bounded scan read in full for every day it dates
+    /// (`COMPLETE_DAY_SUBMIT_CLIENTS`). Empty on a full-history scan, whose
+    /// `full_history_clients` already cover every day.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    complete_day_clients: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retention_floors: Option<std::collections::BTreeMap<String, String>>,
     /// Per-day correction evidence for clients whose declared generation
@@ -5350,15 +5382,15 @@ struct TsScanScope {
     recount_proofs: Option<TsRecountProofs>,
 }
 
-/// Strip full-history authority from clients whose history this scan could
-/// only partially read.
+/// Strip full-history and complete-day authority from clients whose history
+/// this scan could only partially read.
 ///
 /// `full_history` so far meant "no date filter was passed". A client whose
 /// session sources partly failed to open satisfies that and still reports less
 /// than it has, and on the receiver a full-history snapshot is what may
-/// rewrite or re-baseline stored history. Withholding the bit keeps those
-/// stored rows untouched until a later scan reads everything.
-fn withhold_full_history_for_clients(
+/// rewrite or re-baseline stored history. Withholding the declaration keeps
+/// those stored rows untouched until a later scan reads everything.
+fn withhold_coverage_for_clients(
     scope: &mut TsScanScope,
     incomplete_clients: &std::collections::BTreeSet<String>,
 ) {
@@ -5368,6 +5400,9 @@ fn withhold_full_history_for_clients(
     let declared = scope.parser_versions.len();
     scope
         .full_history_clients
+        .retain(|client| !incomplete_clients.contains(client));
+    scope
+        .complete_day_clients
         .retain(|client| !incomplete_clients.contains(client));
     scope.full_history = scope.full_history && scope.full_history_clients.len() == declared;
 }
@@ -5666,7 +5701,9 @@ fn full_history_exempt_clients<'a>(
 /// scan can establish or advance a cumulative rollout high-water. A partial
 /// scan still names the clients whose messages it ships unfiltered — their
 /// snapshot semantics make a partial window unsubmittable, so the graph
-/// exempts them from the date filter (see `FULL_HISTORY_SUBMIT_CLIENTS`).
+/// exempts them from the date filter (see `FULL_HISTORY_SUBMIT_CLIENTS`) —
+/// and the clients whose window it ships with every day complete (see
+/// `COMPLETE_DAY_SUBMIT_CLIENTS`).
 fn submit_scan_scope(
     clients: Option<&[String]>,
     full_history: bool,
@@ -5696,14 +5733,48 @@ fn submit_scan_scope(
     } else {
         full_history_exempt_clients(clients, amp_full_history_safe).collect()
     };
+    let complete_day_clients = if full_history {
+        Vec::new()
+    } else {
+        clients
+            .iter()
+            .filter(|client| tokscale_core::COMPLETE_DAY_SUBMIT_CLIENTS.contains(&client.as_str()))
+            .cloned()
+            .collect()
+    };
     let every_client_complete = full_history_clients.len() == clients.len();
     Some(TsScanScope {
         parser_versions,
         // Fail closed for receivers predating `fullHistoryClients`.
         full_history: full_history && every_client_complete,
         full_history_clients,
+        complete_day_clients,
         retention_floors: None,
         recount_proofs: None,
+    })
+}
+
+/// Names the clients a date-bounded submit ships with their whole history, so
+/// a `--week` date range reaching back months reads as intended.
+fn full_history_note(
+    scope: Option<&TsScanScope>,
+    full_history_scan: bool,
+    submitted_clients: &[String],
+) -> Option<String> {
+    if full_history_scan {
+        return None;
+    }
+    let names: Vec<&str> = scope?
+        .full_history_clients
+        .iter()
+        .filter(|client| submitted_clients.contains(client))
+        .map(String::as_str)
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "Full history: {} (the server counts these clients only from a complete snapshot)",
+            names.join(", ")
+        )
     })
 }
 
@@ -7397,7 +7468,7 @@ fn run_submit_command(
     let incomplete_source_clients = incompletely_read_clients(&graph_result.source_reads);
     report_incompletely_read_sources(&graph_result.source_reads);
     let scan_scope = scan_scope.map(|mut scope| {
-        withhold_full_history_for_clients(&mut scope, &incomplete_source_clients);
+        withhold_coverage_for_clients(&mut scope, &incomplete_source_clients);
         scope
     });
 
@@ -7410,6 +7481,13 @@ fn run_submit_command(
         )
         .bright_black()
     );
+    if let Some(note) = full_history_note(
+        scan_scope.as_ref(),
+        full_history_scan,
+        &graph_result.summary.clients,
+    ) {
+        println!("{}", format!("    {note}").bright_black());
+    }
     println!(
         "{}",
         format!("    Active days: {}", graph_result.summary.active_days).bright_black()
@@ -7531,7 +7609,8 @@ fn post_submission(
 
             println!("\n  {}", "Successfully submitted!".green());
             println!();
-            println!("{}", "  Summary:".white());
+            // The server reports the profile after merging, not this payload.
+            println!("{}", "  Profile totals:".white());
             if let Some(id) = body.submission_id {
                 println!("{}", format!("    Submission ID: {}", id).bright_black());
             }
@@ -7573,8 +7652,8 @@ fn post_submission(
             if let Some(warnings) = body.warnings {
                 if !warnings.is_empty() {
                     println!("{}", "  Warnings:".yellow());
-                    for warning in warnings {
-                        println!("{}", format!("    - {}", warning).bright_black());
+                    for line in submission_warnings::compact(&warnings) {
+                        println!("{}", format!("    {line}").bright_black());
                     }
                     println!();
                 }
@@ -8285,6 +8364,13 @@ mod tests {
         calculate_summary_v2, calculate_years_v2, ClientContributionV2, DailyContributionV2,
         DailyTotalsV2, GraphMeta, GraphResultV2, TokenBreakdown,
     };
+
+    #[test]
+    fn format_number_promotes_to_millions_at_the_rounding_boundary() {
+        assert_eq!(format_number(999_949), "999.9K");
+        assert_eq!(format_number(999_950), "1.0M");
+        assert_eq!(format_number(1_500), "1.5K");
+    }
 
     #[test]
     fn model_token_breakdown_json_preserves_all_buckets_in_camel_case() {
@@ -9857,6 +9943,30 @@ mod tests {
     }
 
     #[test]
+    fn test_light_spinner_releases_stderr_between_frames() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let spinner = LightSpinner::start_with_ready("Testing stderr locking...", Some(ready_tx));
+        assert!(
+            ready_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "spinner must render a frame before testing stderr access"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            let _stderr = io::stderr().lock();
+            tx.send(()).unwrap();
+        });
+
+        let acquired_while_running = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        spinner.stop();
+        writer.join().unwrap();
+        assert!(
+            acquired_while_running,
+            "spinner must not hold stderr locked while idle"
+        );
+    }
+
+    #[test]
     fn test_light_spinner_frame_0() {
         let frame = LightSpinner::frame(0);
         assert!(frame.contains(Glyphs::ascii_safe().scanner_active));
@@ -10558,12 +10668,11 @@ mod tests {
         assert_eq!(together.full_history_clients, family);
     }
 
-    /// The exemption list mirrors the receiver's snapshot-integrity set. A
-    /// bounded submit that filtered a recounting client would freeze on the
-    /// receiver and discard the window's usage, and its proof only rides on a
-    /// declared-complete snapshot.
+    /// The receiver budgets Cursor and Devin CLI growth per day, so a bounded
+    /// submit ships only their window and declares each day it dates complete
+    /// instead of shipping their whole history.
     #[test]
-    fn submit_scan_scope_names_recount_clients_complete_on_a_partial_scan() {
+    fn submit_scan_scope_declares_per_day_clients_complete_by_day_on_a_partial_scan() {
         let clients = vec![
             "codex".to_string(),
             "cursor".to_string(),
@@ -10572,12 +10681,17 @@ mod tests {
         let scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
 
         assert!(!scope.full_history);
+        assert!(scope.full_history_clients.is_empty());
         assert_eq!(
-            scope.full_history_clients,
+            scope.complete_day_clients,
             vec!["cursor".to_string(), "devin-cli".to_string()]
         );
         assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
         assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
+
+        let full = submit_scan_scope(Some(&clients), true, true).expect("scope");
+        assert_eq!(full.full_history_clients, clients);
+        assert!(full.complete_day_clients.is_empty());
     }
 
     /// The blocker class from #1414 applies to the bounded path too: a client
@@ -10594,32 +10708,54 @@ mod tests {
             "droid".to_string(),
         ];
         let mut scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
+        assert_eq!(scope.full_history_clients, vec!["droid".to_string()]);
         assert_eq!(
-            scope.full_history_clients,
-            vec![
-                "cursor".to_string(),
-                "devin-cli".to_string(),
-                "droid".to_string(),
-            ]
+            scope.complete_day_clients,
+            vec!["cursor".to_string(), "devin-cli".to_string()]
         );
 
         let mut reads = std::collections::BTreeMap::new();
-        reads.insert(
-            "cursor".to_string(),
-            tokscale_core::SourceReadSummary {
-                discovered: 2,
-                unreadable: 1,
-            },
-        );
-        withhold_full_history_for_clients(&mut scope, &incompletely_read_clients(&reads));
+        for client in ["cursor", "droid"] {
+            reads.insert(
+                client.to_string(),
+                tokscale_core::SourceReadSummary {
+                    discovered: 2,
+                    unreadable: 1,
+                },
+            );
+        }
+        withhold_coverage_for_clients(&mut scope, &incompletely_read_clients(&reads));
 
         assert!(!scope.full_history);
-        assert_eq!(
-            scope.full_history_clients,
-            vec!["devin-cli".to_string(), "droid".to_string()]
-        );
-        // Identity stays declared; only Cursor's completeness authority is gone.
+        assert!(scope.full_history_clients.is_empty());
+        assert_eq!(scope.complete_day_clients, vec!["devin-cli".to_string()]);
+        // Identity stays declared; only the unread clients lose completeness.
         assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
+    }
+
+    #[test]
+    fn full_history_note_names_only_bounded_clients_that_shipped_history() {
+        let clients: Vec<String> = ["codex", "cursor", "droid", "copilot"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let bounded = submit_scan_scope(Some(&clients), false, true);
+        let submitted = vec![
+            "codex".to_string(),
+            "cursor".to_string(),
+            "droid".to_string(),
+        ];
+
+        assert_eq!(
+            full_history_note(bounded.as_ref(), false, &submitted).as_deref(),
+            Some("Full history: droid (the server counts these clients only from a complete snapshot)")
+        );
+        let full = submit_scan_scope(Some(&clients), true, true);
+        assert_eq!(full_history_note(full.as_ref(), true, &submitted), None);
+        assert_eq!(
+            full_history_note(bounded.as_ref(), false, &["codex".to_string()]),
+            None
+        );
     }
 
     /// Generation 2 lowers both recounting clients: Devin CLI collapses
@@ -10730,10 +10866,8 @@ mod tests {
             0
         );
 
-        // A date-bounded submit still ships devin-cli complete (it is in
-        // `FULL_HISTORY_SUBMIT_CLIENTS`), so the client keeps per-client
-        // full-history authority and its proof rides along: the payload
-        // dates every day the proof describes.
+        // A date-bounded submit ships only devin-cli's window, and the
+        // receiver applies no proof from one.
         let bounded = to_ts_token_contribution_data(
             &graph,
             None,
@@ -10741,16 +10875,19 @@ mod tests {
         );
         let bounded_scope = bounded.scan_scope.as_ref().expect("bounded scope");
         assert!(!bounded_scope.full_history);
-        assert_eq!(bounded_scope.full_history_clients, clients);
-        let bounded_proofs = bounded_scope
-            .recount_proofs
-            .as_ref()
-            .expect("bounded submit ships the proof for a declared client");
-        assert!(bounded_proofs.contains_key("devin-cli"));
+        assert!(bounded_scope.full_history_clients.is_empty());
+        assert_eq!(bounded_scope.complete_day_clients, clients);
+        assert!(bounded_scope.recount_proofs.is_none());
+        let bounded_json = serde_json::to_value(&bounded).unwrap();
+        assert_eq!(
+            bounded_json["scanScope"]["completeDayClients"],
+            serde_json::json!(["devin-cli"])
+        );
+        assert!(json["scanScope"].get("completeDayClients").is_none());
 
         // Full-history authority withheld for this client withholds its proof.
         let mut withheld = submit_scan_scope(Some(&clients), true, true).unwrap();
-        withhold_full_history_for_clients(
+        withhold_coverage_for_clients(
             &mut withheld,
             &["devin-cli".to_string()].into_iter().collect(),
         );
@@ -10831,8 +10968,7 @@ mod tests {
             0
         );
 
-        // A bounded CLI request still carries full-history authority for Cursor:
-        // its rows are exempt from the date filter, so the proof is safe.
+        // A bounded request ships Cursor's window, which carries no proof.
         let bounded = to_ts_token_contribution_data(
             &graph,
             None,
@@ -10841,14 +10977,10 @@ mod tests {
         assert!(bounded
             .scan_scope
             .as_ref()
-            .and_then(|scope| scope.recount_proofs.as_ref())
-            .is_some_and(|proofs| proofs.contains_key("cursor")));
+            .is_some_and(|scope| scope.recount_proofs.is_none()));
 
         let mut withheld = submit_scan_scope(Some(&clients), true, true).unwrap();
-        withhold_full_history_for_clients(
-            &mut withheld,
-            &["cursor".to_string()].into_iter().collect(),
-        );
+        withhold_coverage_for_clients(&mut withheld, &["cursor".to_string()].into_iter().collect());
         let withheld = to_ts_token_contribution_data(&graph, None, Some(withheld));
         assert!(withheld
             .scan_scope
@@ -10885,7 +11017,7 @@ mod tests {
         let clients = vec!["claude".to_string(), "devin-cli".to_string()];
         let mut scope = submit_scan_scope(Some(&clients), true, true).unwrap();
         assert!(scope.full_history);
-        withhold_full_history_for_clients(&mut scope, &incomplete);
+        withhold_coverage_for_clients(&mut scope, &incomplete);
         // Fail closed for receivers predating `fullHistoryClients`, but keep
         // the complete sibling's authority for receivers that read it.
         assert!(!scope.full_history);
@@ -10894,9 +11026,177 @@ mod tests {
 
         // Nothing unreadable leaves the scope untouched.
         let mut intact = submit_scan_scope(Some(&clients), true, true).unwrap();
-        withhold_full_history_for_clients(&mut intact, &std::collections::BTreeSet::new());
+        withhold_coverage_for_clients(&mut intact, &std::collections::BTreeSet::new());
         assert!(intact.full_history);
         assert_eq!(intact.full_history_clients.len(), 2);
+    }
+
+    /// A readable SQLite COUNT is not proof that every Devin row decoded.
+    /// Exercise the real source graph, then the same authority filtering and
+    /// serializer as submit; a partial graph must not authorize history repair.
+    #[test]
+    #[serial_test::serial]
+    fn partial_devin_graph_withholds_serialized_submission_authority() {
+        struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (key, previous) in self.0.drain(..).rev() {
+                    unsafe {
+                        match previous {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+
+        let home = tempfile::TempDir::new().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let values = [
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("TOKSCALE_CONFIG_DIR", config.path().as_os_str().to_owned()),
+            ("TOKSCALE_PRICING_CACHE_ONLY", "1".into()),
+            ("TOKSCALE_EXTRA_DIRS", "".into()),
+            ("TOKSCALE_HEADLESS_DIR", "".into()),
+        ];
+        let _restore = EnvRestore(
+            values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for (key, value) in values {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let db = home.path().join(".local/share/devin/cli/sessions.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, working_directory TEXT, title TEXT);
+             CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY, session_id TEXT, chat_message TEXT, created_at INTEGER);
+             INSERT INTO sessions VALUES ('sess', 'gpt-5', '/tmp/project', 'Task');",
+        ).unwrap();
+        // The duplicate supplies a genuine recount proof on a complete read.
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO message_nodes (session_id, chat_message, created_at) VALUES ('sess', ?1, 1700000000)",
+                [r#"{"role":"assistant","metadata":{"request_id":"req-1","metrics":{"input_tokens":67,"output_tokens":103}}}"#],
+            ).unwrap();
+        }
+        let cursor_dir = home.path().join("imports/cursor");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        std::fs::write(
+            cursor_dir.join("usage.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "usageEventsDisplay": [{
+                    "timestamp": "1700000000000",
+                    "model": "gpt-5",
+                    "chargedCents": 1.0,
+                    "tokenUsage": {"inputTokens": 11, "outputTokens": 7, "totalCents": 1.0},
+                    "conversationId": "complete-sibling",
+                    "usageEventId": "cursor-event"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let clients = vec!["cursor".to_string(), "devin-cli".to_string()];
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let scan = || {
+            // This public source-only graph uses the same streaming parser and
+            // SourceReadSummary as submission, without remote pricing fetches.
+            runtime
+                .block_on(tokscale_core::generate_source_graph_report_v2(
+                    tokscale_core::ReportOptions {
+                        home_dir: Some(home.path().to_str().unwrap().to_string()),
+                        use_env_roots: false,
+                        clients: Some(clients.clone()),
+                        scanner_settings: tokscale_core::scanner::ScannerSettings {
+                            extra_scan_paths: [("cursor".to_string(), vec![cursor_dir.clone()])]
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ))
+                .unwrap()
+        };
+        let payload = |graph: &tokscale_core::GraphResultV2, full_history| {
+            let mut scope = submit_scan_scope(Some(&clients), full_history, true).unwrap();
+            withhold_coverage_for_clients(
+                &mut scope,
+                &incompletely_read_clients(&graph.source_reads),
+            );
+            serde_json::to_value(to_ts_token_contribution_data(graph, None, Some(scope))).unwrap()
+        };
+
+        let complete = scan();
+        assert!(complete.source_reads["devin-cli"].complete());
+        assert!(complete.source_reads["cursor"].complete());
+        assert_eq!(complete.source_reads["cursor"].discovered, 1);
+        let full = payload(&complete, true);
+        assert_eq!(full["scanScope"]["fullHistory"], true);
+        assert!(full["scanScope"]["recountProofs"]["devin-cli"].is_object());
+        let bounded = payload(&complete, false);
+        assert_eq!(
+            bounded["scanScope"]["completeDayClients"],
+            serde_json::json!(["cursor", "devin-cli"])
+        );
+
+        for broken_row in ["X'FF'", "'{invalid json'"] {
+            conn.execute_batch(&format!(
+                "DELETE FROM message_nodes WHERE row_id = 3;
+                 INSERT INTO message_nodes VALUES (3, 'sess', {broken_row}, 1700000000);"
+            ))
+            .unwrap();
+            let partial = scan();
+            assert!(
+                partial.contributions.iter().any(|day| {
+                    day.clients
+                        .iter()
+                        .any(|client| client.client == "devin-cli")
+                }),
+                "readable Devin usage must remain available for local display"
+            );
+            for full_history in [true, false] {
+                let json = payload(&partial, full_history);
+                let scope = &json["scanScope"];
+                assert_eq!(
+                    scope["fullHistory"], false,
+                    "{broken_row}: partial history must not be authoritative"
+                );
+                for field in ["fullHistoryClients", "completeDayClients"] {
+                    assert!(
+                        scope[field].as_array().is_none_or(|clients| {
+                            !clients.iter().any(|client| client == "devin-cli")
+                        }),
+                        "{broken_row}: Devin must be absent from {field}: {scope}"
+                    );
+                }
+                assert!(scope["recountProofs"].get("devin-cli").is_none());
+                assert_eq!(scope["parserVersions"]["devin-cli"], 2);
+                if full_history {
+                    assert_eq!(scope["fullHistoryClients"], serde_json::json!(["cursor"]));
+                    assert!(scope["recountProofs"]["cursor"].is_object());
+                } else {
+                    assert_eq!(scope["completeDayClients"], serde_json::json!(["cursor"]));
+                }
+            }
+            assert!(!partial.source_reads["devin-cli"].complete());
+            assert!(partial.source_reads["cursor"].complete());
+        }
+
+        // Repairing the unreadable row restores authority; no partial warm
+        // cache may keep serving an incomplete snapshot after the repair.
+        conn.execute("DELETE FROM message_nodes WHERE row_id = 3", [])
+            .unwrap();
+        let repaired = payload(&scan(), true);
+        assert_eq!(repaired["scanScope"]["fullHistory"], true);
+        assert!(repaired["scanScope"]["recountProofs"]["devin-cli"].is_object());
     }
 
     /// The tip is advice for a person at a prompt. Autosubmit's stdout is the
